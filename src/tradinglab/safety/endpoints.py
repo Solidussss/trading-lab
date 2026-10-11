@@ -50,8 +50,20 @@ class EndpointNotAllowedError(RuntimeError):
 
 
 def normalize_host(host: str) -> str:
-    """Lower-case, strip whitespace, a trailing dot, and any port."""
-    h = host.strip().lower()
+    """Canonical ASCII host: IDNA-encoded, lower-case, no whitespace, trailing dot, or port.
+
+    Non-ASCII hosts are converted the same way the socket layer converts them (IDNA), so
+    look-alikes such as 'api。alpaca。markets' (ideographic full stops) or an
+    appended zero-width space normalise to the real host they would resolve to. A non-ASCII
+    host that cannot be converted is refused outright (fail closed).
+    """
+    h = host.strip()
+    if not h.isascii():
+        try:
+            h = h.encode("idna").decode("ascii")
+        except UnicodeError as exc:
+            raise EndpointNotAllowedError("Unconvertible non-ASCII hostname refused.") from exc
+    h = h.lower()
     if h.startswith("[") and "]" in h:  # IPv6 literal
         return h[1 : h.index("]")]
     if h.count(":") == 1:

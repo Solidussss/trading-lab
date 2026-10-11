@@ -47,10 +47,10 @@ AMBIGUOUS_ENV_VARS: Final = (
     "ALPACA_BASE_URL",
     "ALPACA_ENDPOINT",
 )
-PROXY_ENV_VARS: Final = frozenset({"HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"})
 _LIVE_ENV_NAME_RE: Final = re.compile(r"(ALPACA|APCA).*LIVE|LIVE.*(ALPACA|APCA)")
 _TRUE: Final = frozenset({"true", "1", "yes"})
-_FALSE: Final = frozenset({"false", "0", "no", ""})
+_FALSE: Final = frozenset({"false", "0", "no"})
+_DECIMAL_RE: Final = re.compile(r"^-?\d+(\.\d+)?$")
 
 
 class Secret:
@@ -71,6 +71,9 @@ class Secret:
 
     def __format__(self, spec: str) -> str:
         return repr(self)
+
+    def __reduce__(self):  # refuse pickling/copying to disk, queues, caches
+        raise TypeError("Secret values cannot be pickled.")
 
     def __eq__(self, other: object) -> bool:  # pragma: no cover - convenience only
         return isinstance(other, Secret) and other._value == self._value
@@ -122,30 +125,34 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     """Build Settings from an environment mapping (pass `os.environ` in production)."""
     _reject_ambiguous(env)
 
-    app_env = _required(env, "APP_ENV").lower()
-    if app_env not in ALLOWED_APP_ENVS:
+    app_env = _required(env, "APP_ENV")
+    if app_env not in ALLOWED_APP_ENVS:  # exact, lower-case
         raise ConfigError(f"APP_ENV must be one of {sorted(ALLOWED_APP_ENVS)}.")
-    if app_env != "test":
-        # An HTTP(S) proxy hides the real destination from the socket-level network guard
-        # (libraries such as requests/urllib3 connect only to the proxy). Fail closed.
-        proxies = sorted(n for n in env if n.upper() in PROXY_ENV_VARS and env[n].strip())
-        if proxies:
-            raise ConfigError(
-                "Proxy variables " + ", ".join(proxies) + " are not allowed outside tests: "
-                "they would hide broker destinations from the paper-only network guard."
-            )
+    # An HTTP(S) proxy hides the real destination from the socket-level network guard
+    # (requests/urllib3 connect only to the proxy). Refused in every environment.
+    proxies = sorted(
+        n for n in env
+        if n.upper().endswith("_PROXY") and n.upper() != "NO_PROXY" and env[n].strip()
+    )
+    if proxies:
+        raise ConfigError(
+            "Proxy variables " + ", ".join(proxies) + " are not allowed: they would hide "
+            "broker destinations from the paper-only network guard."
+        )
 
     mode = _required(env, "TRADING_MODE")
     if mode != "paper":
         # Exact match only: "Paper", "paper ", "live", "both" all fail.
         raise ConfigError("TRADING_MODE must be exactly 'paper'. Live trading is not supported.")
 
-    key = _required(env, "ALPACA_PAPER_API_KEY")
-    secret = _required(env, "ALPACA_PAPER_SECRET_KEY")
-    _validate_paper_key_id(key)
-    if len(secret) < 20 or secret.strip() != secret:
+    # Wrap secrets immediately so the raw strings never sit in this frame's locals, where
+    # error trackers that capture local variables could record them.
+    api_key = Secret(_required(env, "ALPACA_PAPER_API_KEY"))
+    api_secret = Secret(_required(env, "ALPACA_PAPER_SECRET_KEY"))
+    _validate_paper_key_id(api_key)
+    if len(api_secret.get()) < 20 or not api_secret.get().isprintable():
         raise ConfigError("ALPACA_PAPER_SECRET_KEY looks malformed.")
-    if key == secret:
+    if api_key.get() == api_secret.get():
         raise ConfigError("API key and secret must differ.")
 
     risk = RiskLimits(
@@ -159,7 +166,9 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     capital = _decimal(env, "CAPITAL_BASE_USD", "10000")
     _range("CAPITAL_BASE_USD", capital, HARD_MAX_CAPITAL_BASE, minimum=Decimal("100"))
 
-    symbols = tuple(s.strip().upper() for s in env.get("SYMBOLS", "SPY,QQQ,IWM").split(","))
+    symbols = tuple(
+        s.strip().upper() for s in _optional(env, "SYMBOLS", "SPY,QQQ,IWM").split(",")
+    )
     if not symbols or any(not SYMBOL_RE.match(s) for s in symbols):
         raise ConfigError("SYMBOLS must be a comma-separated list of tickers.")
     if len(set(symbols)) != len(symbols):
@@ -167,8 +176,8 @@ def load_settings(env: Mapping[str, str]) -> Settings:
 
     return Settings(
         app_env=app_env,
-        alpaca_api_key=Secret(key),
-        alpaca_secret_key=Secret(secret),
+        alpaca_api_key=api_key,
+        alpaca_secret_key=api_secret,
         order_submission_enabled=_bool(env, "ORDER_SUBMISSION_ENABLED", default=False),
         capital_base_usd=capital,
         symbols=symbols,
@@ -194,30 +203,45 @@ def _reject_ambiguous(env: Mapping[str, str]) -> None:
         )
 
 
-def _validate_paper_key_id(key: str) -> None:
-    if key.strip() != key or not key.isalnum():
+def _validate_paper_key_id(key: Secret) -> None:
+    if not key.get().isalnum():
         raise ConfigError("ALPACA_PAPER_API_KEY looks malformed.")
-    upper = key.upper()
-    if upper.startswith("AK"):
+    if key.get().upper().startswith("AK"):
         raise ConfigError("ALPACA_PAPER_API_KEY looks like a LIVE key (prefix 'AK'). Refusing.")
-    if not upper.startswith("PK"):
+    if not key.get().upper().startswith("PK"):
         raise ConfigError(
             "ALPACA_PAPER_API_KEY must be a paper key (prefix 'PK'). "
             "Unrecognised key formats are refused."
         )
-    if len(key) < 16:
+    if len(key.get()) < 16:
         raise ConfigError("ALPACA_PAPER_API_KEY looks too short.")
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
-    value = env.get(name)
-    if value is None or not value.strip():
+    """Exact value of a required variable. Surrounding whitespace is an error, not trimmed."""
+    if name not in env or not env[name].strip():
         raise ConfigError(f"{name} is required.")
-    return value.strip() if name not in ("TRADING_MODE",) else value
+    if env[name] != env[name].strip():
+        raise ConfigError(f"{name} has leading/trailing whitespace.")
+    return env[name]
+
+
+def _optional(env: Mapping[str, str], name: str, default: str) -> str:
+    """Optional variable: absent -> default. Present but empty/padded -> error (ambiguous)."""
+    if name not in env:
+        return default
+    raw = env[name]
+    if not raw.strip():
+        raise ConfigError(f"{name} is set but empty; set a value or remove it.")
+    if raw != raw.strip():
+        raise ConfigError(f"{name} has leading/trailing whitespace.")
+    return raw
 
 
 def _decimal(env: Mapping[str, str], name: str, default: str) -> Decimal:
-    raw = env.get(name, default).strip() or default
+    raw = _optional(env, name, default)
+    if not _DECIMAL_RE.match(raw):
+        raise ConfigError(f"{name} must be a plain decimal number, got {raw!r}.")
     try:
         value = Decimal(raw)
     except InvalidOperation as exc:
@@ -228,23 +252,21 @@ def _decimal(env: Mapping[str, str], name: str, default: str) -> Decimal:
 
 
 def _int(env: Mapping[str, str], name: str, default: int) -> int:
-    raw = env.get(name, str(default)).strip() or str(default)
-    try:
-        return int(raw)
-    except ValueError as exc:
-        raise ConfigError(f"{name} must be an integer, got {raw!r}.") from exc
+    raw = _optional(env, name, str(default))
+    if not re.fullmatch(r"\d{1,6}", raw):
+        raise ConfigError(f"{name} must be a whole number, got {raw!r}.")
+    return int(raw)
 
 
 def _bool(env: Mapping[str, str], name: str, default: bool) -> bool:
-    raw = env.get(name)
-    if raw is None:
+    if name not in env:
         return default
-    v = raw.strip().lower()
+    v = _optional(env, name, "").lower()
     if v in _TRUE:
         return True
     if v in _FALSE:
         return False
-    raise ConfigError(f"{name} must be true or false, got {raw!r}.")
+    raise ConfigError(f"{name} must be true or false, got {v!r}.")
 
 
 def _range(name: str, value: Decimal, maximum: Decimal, minimum: Decimal = Decimal(0)) -> None:

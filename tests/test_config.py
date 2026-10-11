@@ -92,10 +92,46 @@ class LoadSettingsTests(unittest.TestCase):
             load_settings(valid_env(SYMBOLS="SPY,spy"))
         with self.assertRaises(ConfigError):
             load_settings(valid_env(SYMBOLS="SPY,BRK.B"))
-        self.assertEqual(load_settings(valid_env(SYMBOLS=" spy , qqq ")).symbols, ("SPY", "QQQ"))
+        self.assertEqual(load_settings(valid_env(SYMBOLS="spy, qqq")).symbols, ("SPY", "QQQ"))
+
+
+class StrictParsingTests(unittest.TestCase):
+    def test_padded_or_empty_values_rejected_not_trimmed(self):
+        for name, value in (("APP_ENV", " test"), ("ALPACA_PAPER_API_KEY", "PKTESTFAKE0000000000 "),
+                            ("RISK_PER_TRADE_PCT", ""), ("ORDER_SUBMISSION_ENABLED", ""),
+                            ("SYMBOLS", " SPY"), ("MAX_OPEN_POSITIONS", " 3")):
+            with self.subTest(name=name, value=value), self.assertRaises(ConfigError):
+                load_settings(valid_env(**{name: value}))
+
+    def test_app_env_exact_lowercase(self):
+        with self.assertRaises(ConfigError):
+            load_settings(valid_env(APP_ENV="Production"))
+
+    def test_numeric_formats(self):
+        for name, value in (("MAX_OPEN_POSITIONS", "1_0"), ("MAX_OPEN_POSITIONS", "2.0"),
+                            ("RISK_PER_TRADE_PCT", "5e-3"), ("RISK_PER_TRADE_PCT", "0.005%")):
+            with self.subTest(value=value), self.assertRaises(ConfigError):
+                load_settings(valid_env(**{name: value}))
+
+    def test_any_proxy_variable_refused_in_every_env(self):
+        for app_env in ("test", "development", "production"):
+            for var in ("HTTPS_PROXY", "http_proxy", "ALL_PROXY", "WSS_PROXY", "ftp_proxy"):
+                with self.subTest(env=app_env, var=var), self.assertRaises(ConfigError):
+                    load_settings(valid_env(APP_ENV=app_env, **{var: "http://p:3128"}))
+        load_settings(valid_env(NO_PROXY="localhost"))  # NO_PROXY is harmless
 
 
 class SecretHandlingTests(unittest.TestCase):
+    def test_secret_cannot_be_pickled_or_copied(self):
+        import copy
+        import pickle
+
+        s = load_settings(valid_env())
+        with self.assertRaises(TypeError):
+            pickle.dumps(s.alpaca_secret_key)
+        with self.assertRaises(TypeError):
+            copy.deepcopy(s.alpaca_api_key)
+
     def test_secrets_never_in_repr_or_str(self):
         s = load_settings(valid_env())
         for text in (repr(s), str(s), f"{s}", repr(s.alpaca_api_key), f"{s.alpaca_secret_key}"):

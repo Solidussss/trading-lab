@@ -79,9 +79,10 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
     if event not in _EVENTS:
         return
     for host in _extract_hosts(event, args):
-        if not is_alpaca_host(host):
-            continue
         try:
+            # is_alpaca_host IDNA-normalises first; unconvertible non-ASCII hosts raise.
+            if not is_alpaca_host(host):
+                continue
             check_alpaca_host(host)
         except (LiveTradingForbiddenError, EndpointNotAllowedError) as exc:
             _blocked_attempts.append(host)

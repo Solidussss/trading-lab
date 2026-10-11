@@ -11,7 +11,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 class SelfCheckTests(unittest.TestCase):
     def test_passes_with_valid_paper_config(self):
-        report = run_selfcheck(valid_env())
+        report = run_selfcheck(valid_env(), system_proxies=dict)
         self.assertTrue(report.ok)
         names = {name for name, _, _ in report.checks}
         self.assertTrue({"network_guard_installed", "trading_url_is_paper",
@@ -21,9 +21,31 @@ class SelfCheckTests(unittest.TestCase):
 
     def test_fails_closed_on_bad_config(self):
         with self.assertRaises(SafetyCheckFailedError):
-            run_selfcheck(valid_env(TRADING_MODE="live"))
+            run_selfcheck(valid_env(TRADING_MODE="live"), system_proxies=dict)
         with self.assertRaises(SafetyCheckFailedError):
-            run_selfcheck({})
+            run_selfcheck({}, system_proxies=dict)
+
+    def test_fails_when_os_level_proxy_configured(self):
+        # e.g. a macOS system proxy, which requests honours but env vars do not show
+        with self.assertRaises(SafetyCheckFailedError) as ctx:
+            run_selfcheck(valid_env(), system_proxies=lambda: {"https": "http://corp:8080"})
+        self.assertIn("no_proxies", str(ctx.exception))
+
+    def test_fails_with_non_standard_event_loop(self):
+        import asyncio
+
+        class FakeUvloopPolicy(asyncio.DefaultEventLoopPolicy):
+            pass
+
+        FakeUvloopPolicy.__module__ = "uvloop"
+        original = asyncio.get_event_loop_policy()
+        asyncio.set_event_loop_policy(FakeUvloopPolicy())
+        try:
+            with self.assertRaises(SafetyCheckFailedError) as ctx:
+                run_selfcheck(valid_env(), system_proxies=dict)
+            self.assertIn("standard_asyncio_loop", str(ctx.exception))
+        finally:
+            asyncio.set_event_loop_policy(original)
 
 
 class NoSecretsInRepoTests(unittest.TestCase):

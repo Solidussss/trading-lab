@@ -16,7 +16,10 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
+
+if TYPE_CHECKING:
+    from tradinglab.safety.order_gate import GateDecision
 
 
 class Side(StrEnum):
@@ -152,6 +155,8 @@ class Broker(Protocol):
 
     def get_order_by_client_id(self, client_order_id: str) -> Order | None: ...
 
-    def submit_order(self, request: OrderRequest) -> Order: ...
+    def submit_order(self, request: OrderRequest, decision: GateDecision) -> Order:
+        """Must call safety.order_gate.require_gate_approval(request, decision) first."""
+        ...
 
     def cancel_order(self, order_id: str) -> None: ...

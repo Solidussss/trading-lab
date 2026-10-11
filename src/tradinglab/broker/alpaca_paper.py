@@ -41,10 +41,11 @@ from tradinglab.safety.endpoints import (
     validate_trading_url,
 )
 from tradinglab.safety.network_guard import install_network_guard
+from tradinglab.safety.order_gate import GateDecision, require_gate_approval
 
 log = logging.getLogger(__name__)
 
-# Attribute names alpaca-py's RESTClient has used for the resolved base URL.
+# Attribute names alpaca-py's base REST class has used for the resolved base URL.
 _BASE_URL_ATTRS = ("_base_url", "base_url")
 
 
@@ -70,8 +71,17 @@ def build_paper_trading_client(settings: Settings, *, client_cls: Any | None = N
         paper=True,
         url_override=url,
     )
+    disable_env_proxies(client)
     verify_client_is_paper(client)
     return client
+
+
+def disable_env_proxies(client: Any) -> None:
+    """Stop the client's requests.Session from picking up proxy settings from the
+    environment or OS (defence in depth; config and self-check already refuse proxies)."""
+    session = getattr(client, "_session", None)
+    if session is not None and hasattr(session, "trust_env"):
+        session.trust_env = False
 
 
 def verify_client_is_paper(client: Any) -> None:
@@ -80,7 +90,7 @@ def verify_client_is_paper(client: Any) -> None:
     for attr in _BASE_URL_ATTRS:
         value = getattr(client, attr, None)
         if value:
-            # alpaca-py's BaseURL is a (str, Enum); str() of a member is its name, not URL.
+            # alpaca-py's URL enum is a (str, Enum); str() of a member is its name, not URL.
             resolved = str(getattr(value, "value", value))
             break
     if resolved is None:
@@ -149,15 +159,16 @@ class AlpacaPaperBroker:
     def get_order_by_client_id(self, client_order_id: str) -> Order | None:
         try:
             o = self._client.get_order_by_client_id(client_order_id)
-        except Exception as exc:  # alpaca-py raises APIError on 404
-            if _is_not_found(exc):
+        except Exception as exc:  # alpaca-py raises APIError; only a genuine 404 means "none"
+            if _http_status(exc) == 404:
                 return None
             raise
         return _to_order(o)
 
     # -- writes --------------------------------------------------------------------------
 
-    def submit_order(self, request: OrderRequest) -> Order:
+    def submit_order(self, request: OrderRequest, decision: GateDecision) -> Order:
+        require_gate_approval(request, decision)
         verify_client_is_paper(self._client)  # re-check immediately before any write
 
         from alpaca.trading.enums import OrderSide
@@ -184,11 +195,11 @@ class AlpacaPaperBroker:
         self._client.cancel_order_by_id(order_id)
 
 
-def _is_not_found(exc: Exception) -> bool:
-    code = getattr(exc, "status_code", None) or getattr(
-        getattr(exc, "response", None), "status_code", None
-    )
-    return code == 404 or "not found" in str(exc).lower()
+def _http_status(exc: Exception) -> int | None:
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+    return code if isinstance(code, int) else None
 
 
 def _to_order(o: Any) -> Order:

@@ -34,7 +34,7 @@ from tradinglab.safety.endpoints import (
     LiveTradingForbiddenError,
 )
 from tradinglab.safety.network_guard import blocked_attempts, install_network_guard
-from tradinglab.safety.order_gate import InMemoryPause, OrderGate
+from tradinglab.safety.order_gate import GateDecision, GateOutcome, InMemoryPause, OrderGate
 
 SRC = pathlib.Path(__file__).resolve().parents[1] / "src" / "tradinglab"
 
@@ -146,10 +146,46 @@ class C_AdapterTests(unittest.TestCase):
         client = RecordingTradingClient(paper=True, url_override="https://paper-api.alpaca.markets")
         broker = AlpacaPaperBroker(settings(), client=client)
         client._base_url = "https://api.alpaca.markets"  # tamper
+        approved = GateDecision(GateOutcome.SUBMIT, (), _order().client_order_id)
         with self.assertRaises(LiveTradingForbiddenError):
-            broker.submit_order(_order())
+            broker.submit_order(_order(), approved)
         with self.assertRaises(LiveTradingForbiddenError):
             broker.cancel_order("abc")
+        self.assertEqual(client.submitted, [])
+
+
+class C2_AdapterLookupTests(unittest.TestCase):
+    def _broker(self, exc):
+        client = RecordingTradingClient(paper=True, url_override="https://paper-api.alpaca.markets")
+
+        def raise_(cid):
+            raise exc
+
+        client.get_order_by_client_id = raise_
+        return AlpacaPaperBroker(settings(), client=client)
+
+    def test_only_http_404_means_no_order(self):
+        class APIError(Exception):
+            def __init__(self, msg, status_code=None):
+                super().__init__(msg)
+                self.status_code = status_code
+
+        self.assertIsNone(self._broker(APIError("order not found", 404))
+                          .get_order_by_client_id("tl-x"))
+        # "not found" text without a 404 (e.g. a proxy/gateway page) must not be treated as
+        # "no existing order" - that would weaken duplicate-order protection.
+        with self.assertRaises(APIError):
+            self._broker(APIError("upstream not found", 502)).get_order_by_client_id("tl-x")
+        with self.assertRaises(APIError):
+            self._broker(APIError("resource not found")).get_order_by_client_id("tl-x")
+
+    def test_adapter_submit_requires_gate_approval(self):
+        from tradinglab.safety.order_gate import GateBypassError
+
+        client = RecordingTradingClient(paper=True, url_override="https://paper-api.alpaca.markets")
+        broker = AlpacaPaperBroker(settings(), client=client)
+        with self.assertRaises(GateBypassError):
+            broker.submit_order(_order(), None)
         self.assertEqual(client.submitted, [])
 
 
@@ -222,6 +258,20 @@ class E_NetworkGuardTests(unittest.TestCase):
                 with self.subTest(app_env=app_env, var=var), self.assertRaises(ConfigError):
                     load_settings(valid_env(APP_ENV=app_env, **{var: "http://proxy:3128"}))
 
+    def test_unicode_lookalike_hosts_blocked(self):
+        # IDNA maps these to api.alpaca.markets inside the socket layer, after the hook runs.
+        for host in ("api\u3002alpaca\u3002markets", "api\uff0ealpaca\uff0emarkets",
+                     "api\uff61alpaca\uff61markets", "api.alpaca\ufe52markets",
+                     "api.alpaca.markets\u200b", "API\u3002Alpaca\u3002Markets"):
+            with self.subTest(host=repr(host)), self.assertRaises(LiveTradingForbiddenError):
+                socket.getaddrinfo(host, 443)
+
+    def test_unicode_lookalike_urls_rejected(self):
+        from tradinglab.safety.endpoints import validate_trading_url
+
+        with self.assertRaises(LiveTradingForbiddenError):
+            validate_trading_url("https://api\u3002alpaca\u3002markets")
+
     def test_unknown_alpaca_host_blocked(self):
         with self.assertRaises(EndpointNotAllowedError):
             socket.getaddrinfo("some-new-host.alpaca.markets", 443)
@@ -260,7 +310,7 @@ class F_SourceCodeTests(unittest.TestCase):
         return [p for p in SRC.rglob("*.py")]
 
     def test_no_paper_false_anywhere(self):
-        pat = re.compile(r"paper\s*=\s*False")
+        pat = re.compile(r"paper\s*=\s*(False|0\b|None|[\"']false)")
         offenders = [str(p) for p in self._py_files() if pat.search(p.read_text())]
         self.assertEqual(offenders, [])
 
@@ -274,14 +324,28 @@ class F_SourceCodeTests(unittest.TestCase):
 
     def test_trading_client_constructed_only_in_adapter(self):
         allowed = {SRC / "broker" / "alpaca_paper.py"}
-        pat = re.compile(r"TradingClient|url_override\s*=")
+        pat = re.compile(r"TradingClient|alpaca\.trading")
         offenders = [
             str(p) for p in self._py_files() if p not in allowed and pat.search(p.read_text())
         ]
         self.assertEqual(offenders, [])
 
+    def test_url_override_only_in_vetted_adapters(self):
+        # The paper trading adapter (validated paper URL) and the read-only market-data
+        # client (validated data host). Nowhere else may redirect an Alpaca client.
+        allowed = {SRC / "broker" / "alpaca_paper.py", SRC / "marketdata" / "alpaca_data.py"}
+        pat = re.compile(r"url_override\s*=")
+        offenders = [
+            str(p) for p in self._py_files() if p not in allowed and pat.search(p.read_text())
+        ]
+        self.assertEqual(offenders, [])
+        data_src = (SRC / "marketdata" / "alpaca_data.py").read_text()
+        self.assertIn("validate_data_url(url)", data_src)
+        self.assertNotIn("submit_order", data_src)
+
     def test_no_legacy_or_broker_sdks(self):
-        pat = re.compile(r"alpaca_trade_api|alpaca\.broker|BrokerClient")
+        pat = re.compile(r"alpaca_trade_api|alpaca\.broker|BrokerClient|alpaca\.common"
+                         r"|RESTClient|TRADING_LIVE|BaseURL")
         offenders = [str(p) for p in self._py_files() if pat.search(p.read_text())]
         self.assertEqual(offenders, [])
 

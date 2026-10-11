@@ -6,7 +6,13 @@ from tests.helpers import settings
 from tradinglab.broker.base import OrderRequest, OrderType, Side, make_client_order_id
 from tradinglab.broker.fake import FakePaperBroker
 from tradinglab.engine.risk import RiskParams, evaluate_halts, size_long_position
-from tradinglab.safety.order_gate import GateOutcome, InMemoryPause, OrderGate
+from tradinglab.safety.order_gate import (
+    GateBypassError,
+    GateDecision,
+    GateOutcome,
+    InMemoryPause,
+    OrderGate,
+)
 
 
 def req(side=Side.BUY, qty=10, symbol="SPY", cid="tl-x-1"):
@@ -58,7 +64,8 @@ class OrderGateTests(unittest.TestCase):
         self.assertIn("symbol_not_allowed:TSLA", d.reasons)
 
     def test_duplicate_client_order_id(self):
-        self.broker.submit_order(req(cid="tl-dup-1"))
+        first = req(cid="tl-dup-1")
+        self.broker.submit_order(first, self.gate().check(first, held_qty=Decimal(0)))
         d = self.gate().check(req(cid="tl-dup-1"), held_qty=Decimal(0))
         self.assertIn("duplicate_client_order_id", d.reasons)
 
@@ -70,6 +77,34 @@ class OrderGateTests(unittest.TestCase):
         d = g.check(req(side=Side.SELL, qty=3, cid="tl-x-9"), held_qty=Decimal(3),
                     entries_halted=True)
         self.assertTrue(d.may_submit)
+
+
+class GateBypassTests(unittest.TestCase):
+    def setUp(self):
+        self.broker = FakePaperBroker(prices={"SPY": Decimal(500)})
+        self.gate = OrderGate(settings(ORDER_SUBMISSION_ENABLED="true"), self.broker,
+                              InMemoryPause())
+
+    def test_submit_without_approval_refused(self):
+        r = req()
+        for bad in (None, GateDecision(GateOutcome.REJECT, ("x",), r.client_order_id),
+                    GateDecision(GateOutcome.DRY_RUN, (), r.client_order_id)):
+            with self.subTest(decision=bad), self.assertRaises(GateBypassError):
+                self.broker.submit_order(r, bad)
+        self.assertEqual(self.broker.submit_calls, 0)
+
+    def test_approval_is_bound_to_one_order(self):
+        a, b = req(cid="tl-a-1"), req(cid="tl-b-1")
+        approval_for_a = self.gate.check(a, held_qty=Decimal(0))
+        with self.assertRaises(GateBypassError):
+            self.broker.submit_order(b, approval_for_a)
+        self.broker.submit_order(a, approval_for_a)  # ok
+
+    def test_dry_run_decision_cannot_submit(self):
+        g = OrderGate(settings(), self.broker, InMemoryPause())  # submission disabled
+        r = req()
+        with self.assertRaises(GateBypassError):
+            self.broker.submit_order(r, g.check(r, held_qty=Decimal(0)))
 
 
 class OrderRequestTests(unittest.TestCase):

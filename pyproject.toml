@@ -22,7 +22,9 @@ dependencies = [
 # Phases 4-6 (database, API, dashboard backend). Declared now so the lock is stable.
 server = [
     "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
+    # Plain uvicorn on purpose: uvicorn[standard] installs uvloop, whose C-level DNS and
+    # sockets bypass the Python audit hook used by the paper-only network guard.
+    "uvicorn>=0.30",
     "sqlalchemy>=2.0",
     "psycopg[binary]>=3.2",
     "alembic>=1.13",

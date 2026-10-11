@@ -20,11 +20,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from decimal import Decimal
 from enum import StrEnum
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
-from tradinglab.broker.base import Broker, OrderRequest, Side
+from tradinglab.broker.base import OrderRequest, Side
 from tradinglab.config import Settings
 from tradinglab.safety.endpoints import LiveTradingForbiddenError
+
+if TYPE_CHECKING:
+    from tradinglab.broker.base import Broker
+
+
+class GateBypassError(RuntimeError):
+    """An order reached a broker without an approving gate decision for that exact order."""
 
 
 class GateOutcome(StrEnum):
@@ -37,6 +44,7 @@ class GateOutcome(StrEnum):
 class GateDecision:
     outcome: GateOutcome
     reasons: tuple[str, ...] = field(default_factory=tuple)
+    client_order_id: str = ""  # the order this decision approves
 
     @property
     def may_submit(self) -> bool:
@@ -108,8 +116,17 @@ class OrderGate:
         if self._broker.get_order_by_client_id(request.client_order_id) is not None:
             reasons.append("duplicate_client_order_id")
 
+        cid = request.client_order_id
         if reasons:
-            return GateDecision(GateOutcome.REJECT, tuple(reasons))
+            return GateDecision(GateOutcome.REJECT, tuple(reasons), cid)
         if not self._settings.order_submission_enabled:
-            return GateDecision(GateOutcome.DRY_RUN, ("order_submission_disabled",))
-        return GateDecision(GateOutcome.SUBMIT)
+            return GateDecision(GateOutcome.DRY_RUN, ("order_submission_disabled",), cid)
+        return GateDecision(GateOutcome.SUBMIT, (), cid)
+
+
+def require_gate_approval(request: OrderRequest, decision: GateDecision) -> None:
+    """Brokers call this first in submit_order: no approving decision, no order."""
+    if not isinstance(decision, GateDecision) or not decision.may_submit:
+        raise GateBypassError("submit_order called without an approving gate decision.")
+    if decision.client_order_id != request.client_order_id:
+        raise GateBypassError("gate decision does not belong to this order.")

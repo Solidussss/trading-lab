@@ -11,6 +11,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 
+from tradinglab.safety.order_gate import GateDecision, require_gate_approval
 from tradinglab.broker.base import (
     Account,
     MarketClock,
@@ -74,7 +75,8 @@ class FakePaperBroker:
 
     # -- writes --------------------------------------------------------------------------
 
-    def submit_order(self, request: OrderRequest) -> Order:
+    def submit_order(self, request: OrderRequest, decision: GateDecision) -> Order:
+        require_gate_approval(request, decision)
         self.submit_calls += 1
         if self.timeout_next:
             self.timeout_next = False

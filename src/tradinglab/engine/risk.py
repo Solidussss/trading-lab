@@ -22,6 +22,12 @@ class RiskParams:
     # Extra adverse move assumed beyond the stop when sizing (gaps, slippage). A stop at
     # $95 on a $100 entry with 1% gap buffer is sized as if the loss could be $6/share.
     stop_gap_buffer_pct: float = 0.01
+    # Entries are market-on-open LIMIT orders at close * (1 + entry_limit_pct). An open that
+    # gaps above the limit does not fill, so exposure and risk can never exceed what was sized.
+    entry_limit_pct: float = 0.01
+    # A 10% drawdown halt is lifted by you (manual resume) in the live engine. Backtests
+    # model that resume as a reset of the peak after this many halted sessions.
+    drawdown_halt_cooloff_days: int = 20
 
     @classmethod
     def from_limits(cls, limits: RiskLimits, stop_gap_buffer_pct: float = 0.01) -> RiskParams:
