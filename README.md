@@ -2,7 +2,7 @@
 
 Private, autonomous, **simulation-only** trading research system for SPY, QQQ and IWM. It
 runs several pretend-money bots side by side, each with its own $1,000,000 simulated account:
-four day-trading bots on 5-minute prices (flat every night) and one slow daily trend follower.
+five day-trading bots on 5-minute prices (flat every night) and one slow daily trend follower.
 Prices come from Tiingo. There is no brokerage connection and no real-money trading code; see
 `docs/SAFETY.md`.
 
@@ -16,7 +16,7 @@ Prices come from Tiingo. There is no brokerage connection and no real-money trad
 | 4 | PostgreSQL store + migrations, advisory-lock run lock | ✅ done, tested against real PostgreSQL |
 | 5 | Railway service: in-app scheduler (15-min idempotent checks), nightly CLI, restart/catch-up | ✅ done |
 | 6 | Authenticated mobile dashboard | ✅ leaderboard, one page per bot (every trade explained), history-test results, controls |
-| 7 | More strategies | ✅ four day-trading bots (opening breakout, gap-down bounce, VWAP dip, VWAP trend) on a shared intraday core; independently reviewed |
+| 7 | More strategies | ✅ five day-trading bots (opening breakout, gap-down bounce, VWAP dip, VWAP trend, fair value gap) on a shared intraday core with market and resting limit orders; independently reviewed |
 | 7b | Intraday history tests | ✅ background loader (Aug 2017 on) + fixed train/validation windows, sealed final test |
 | 8 | Claude research reports (scheduled / on demand only) | |
 

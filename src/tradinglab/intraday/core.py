@@ -50,6 +50,7 @@ from tradinglab.research.costs import CostModel
 ENTRY_CUTOFF = timedelta(minutes=30)
 MAX_FILL_DELAY = timedelta(minutes=10)
 GAP_BUFFER = 0.001
+LIMIT_TRADE_THROUGH = 0.01  # a resting buy fills only when the price trades a cent below it
 
 # Intraday costs: market orders on SPY/QQQ/IWM at the next 5-minute open. Real spreads are a
 # fraction of a basis point; 2 bp per side plus a further 3 bp on stop fills, plus a
@@ -164,6 +165,7 @@ class _Pos:
     target: float | None
     initial_risk: float
     reason: str
+    by_limit: bool = False
 
 
 @dataclass
@@ -175,6 +177,8 @@ class _Order:
     stop: float | None = None
     target: float | None = None
     diagnostics: Mapping[str, float] = field(default_factory=dict)
+    limit: float | None = None  # resting buy limit (else: market order at the next open)
+    cancel_below: float | None = None
 
 
 class IntradayCore:
@@ -263,7 +267,16 @@ class IntradayCore:
             pending = [(sym, orders.pop(sym)) for sym in sorted(now_bars) if sym in orders]
             for sym, order in sorted(pending, key=lambda x: (x[1].kind != "exit", x[0])):
                 bar = now_bars[sym]
-                if ts - order.placed > MAX_FILL_DELAY:
+                if order.kind == "enter" and order.limit is not None:
+                    self._resting_limit(res, positions, orders, order, bar, ts, budget, cash,
+                                        equity, "paused_by_owner" if is_paused(ts) else
+                                        "daily_loss_halt" if day_halted else
+                                        "peak_drawdown_halt" if latched else None)
+                    if sym in positions and positions[sym].entry_ts == ts:
+                        p = positions[sym]
+                        cash -= p.entry_price * p.shares + p.entry_fees
+                        entries[sym] += 1
+                elif ts - order.placed > MAX_FILL_DELAY:
                     res.signals.append(ISignal(ts, sym, order.kind, "cancelled",
                                                "no price bar right after the signal"))
                 elif order.kind == "exit" and sym in positions:
@@ -288,6 +301,8 @@ class IntradayCore:
                         close_pos(p, ts, bar.open, "stop_gap", stop=True)
                     elif bar.low <= p.stop:
                         close_pos(p, ts, p.stop, "stop_hit", stop=True)
+                    elif p.by_limit and p.entry_ts == ts:
+                        pass  # filled on a dip inside this bar: its high may have come before
                     elif p.target is not None and bar.open >= p.target:
                         close_pos(p, ts, bar.open, "target_hit", stop=False)
                     elif p.target is not None and bar.high >= p.target:
@@ -311,6 +326,15 @@ class IntradayCore:
                     if sym in positions:
                         close_pos(positions[sym], ts, bar.close, "end_of_day", stop=False)
                     continue
+                rest = orders.get(sym)
+                if rest is not None and rest.limit is not None:  # resting order upkeep
+                    gone = ("gap_failed" if rest.cancel_below is not None
+                            and bar.close < rest.cancel_below else
+                            "too_close_to_the_close" if bar.end >= cutoff else None)
+                    if gone:
+                        del orders[sym]
+                        res.signals.append(ISignal(ts, sym, "enter", "cancelled",
+                                                   f"{rest.reason}; {gone}"))
                 ctx = StrategyContext(sym, day, seen[sym], prev_close.get(sym),
                                       positions[sym].entry_price if sym in positions else None,
                                       entries[sym], sess.open_utc, sess.close_utc, stats[sym])
@@ -339,17 +363,18 @@ class IntradayCore:
                 elif len(positions) + sum(o.kind == "enter" for o in orders.values()) \
                         >= self.risk.max_open_positions:
                     why = "max_open_positions"
-                elif not (sig.stop < bar.close):
+                elif not (sig.stop < (sig.limit if sig.limit is not None else bar.close)):
                     why = "stop_not_below_price"
                 if why:
                     res.signals.append(ISignal(ts, sym, "enter", "rejected", f"{sig.reason}; {why}",
                                                sig.diagnostics))
                     continue
                 orders[sym] = _Order(sym, "enter", ts, sig.reason, sig.stop, sig.target,
-                                     sig.diagnostics)
+                                     sig.diagnostics, sig.limit, sig.cancel_below)
                 res.signals.append(ISignal(ts, sym, "enter", "ordered", sig.reason,
                                            {**sig.diagnostics, "stop": sig.stop,
-                                            **({"target": sig.target} if sig.target else {})}))
+                                            **({"target": sig.target} if sig.target else {}),
+                                            **({"limit": sig.limit} if sig.limit else {})}))
 
         if final:  # a symbol missing the final bar is sold at its last known price
             for sym in list(positions):
@@ -373,20 +398,44 @@ class IntradayCore:
 
     # ------------------------------------------------------------------------------------
 
+    def _resting_limit(self, res: DayResult, positions: dict[str, _Pos],
+                       orders: dict[str, _Order], order: _Order, bar: IBar, ts: datetime,
+                       budget: float, cash: float, equity, blocked: str | None) -> None:
+        """A resting buy limit during this bar. It fills at the open if the bar opens at or
+        below the limit, otherwise at the limit if the bar trades at least a cent through it
+        (a touch alone may not fill in a real queue). Unfilled, it keeps resting."""
+        limit = float(order.limit)
+        if blocked:  # the bot's limits apply to resting orders too
+            res.signals.append(ISignal(ts, order.symbol, "enter", "cancelled",
+                                       f"{order.reason}; {blocked}"))
+            return
+        if bar.open <= limit:
+            ref = bar.open
+        elif bar.low <= limit - LIMIT_TRADE_THROUGH:
+            ref = limit
+        else:
+            orders[order.symbol] = order  # not reached yet: keep waiting
+            return
+        self._try_enter(res, positions, order, bar, ts, budget, cash, equity, ref=ref)
+        if order.symbol in positions:
+            positions[order.symbol].by_limit = ref == limit
+
     def _try_enter(self, res: DayResult, positions: dict[str, _Pos], order: _Order, bar: IBar,
-                   ts: datetime, budget: float, cash: float, equity) -> None:
-        """Fill an entry at this bar's open. `equity()` marks positions at the PREVIOUS bar's
-        closes here (phase A runs before phase B), so sizing uses no later prices."""
+                   ts: datetime, budget: float, cash: float, equity, ref: float | None = None
+                   ) -> None:
+        """Fill an entry at `ref` (default: this bar's open). `equity()` marks positions at the
+        PREVIOUS bar's closes here (phase A runs before phase B), so sizing uses no later prices."""
         sym, stop = order.symbol, float(order.stop or 0.0)
+        ref = bar.open if ref is None else ref
         if bar.open <= stop:
             res.signals.append(ISignal(ts, sym, "enter", "cancelled",
                                        f"{order.reason}; opened_below_stop"))
             return
-        if order.target is not None and bar.open >= order.target:
+        if order.target is not None and ref >= order.target:
             res.signals.append(ISignal(ts, sym, "enter", "cancelled",
                                        f"{order.reason}; opened_above_target"))
             return
-        px = self.costs.buy_price(bar.open)
+        px = self.costs.buy_price(ref)
         per_share_risk = px - stop + px * GAP_BUFFER  # sized as if the stop could slip a bit
         eq = equity()
         invested = sum(p.entry_price * p.shares for p in positions.values())
@@ -404,8 +453,8 @@ class IntradayCore:
             res.signals.append(ISignal(ts, sym, "enter", "rejected", f"{order.reason}; {why}"))
             return
         fees = self.costs.fees(sell=False, shares=shares, price=px)
-        positions[sym] = _Pos(sym, shares, ts, px, bar.open, fees, stop, order.target,
+        positions[sym] = _Pos(sym, shares, ts, px, ref, fees, stop, order.target,
                               (px - stop) * shares, order.reason)  # 1R = loss if the stop fills
-        res.fills.append(IFill(ts, sym, "buy", shares, bar.open, px, fees, order.reason))
+        res.fills.append(IFill(ts, sym, "buy", shares, ref, px, fees, order.reason))
         res.signals.append(ISignal(ts, sym, "enter", "filled", order.reason,
                                    {"shares": shares, "price": px, "stop": stop}))

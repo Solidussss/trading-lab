@@ -14,6 +14,7 @@ from tradinglab.intraday.strategies import (
     REGISTRY,
     Enter,
     Exit,
+    FairValueGap,
     GapFill,
     IntradayStrategy,
     OpeningRangeBreakout,
@@ -242,7 +243,7 @@ def ctx_for(bars, sym="SPY", prev=None, pos=None, entries=0):
 
 class StrategyTests(unittest.TestCase):
     def test_registry_has_four_plain_english_strategies(self):
-        self.assertEqual(set(REGISTRY), {"orb", "gap", "vwap_dip", "vwap_trend"})
+        self.assertEqual(set(REGISTRY), {"orb", "gap", "vwap_dip", "vwap_trend", "fvg"})
         for cls in REGISTRY.values():
             self.assertTrue(cls.name and cls.summary and cls.rules)
         with self.assertRaises(ValueError):
@@ -293,6 +294,62 @@ class StrategyTests(unittest.TestCase):
         last = bars[-1]
         bars[-1] = IBar(last.ts, vw + 0.02, vw + 0.2, vw - 0.01, vw + 0.1, 1000.0)
         self.assertIsInstance(VwapTrend().on_bar(ctx_for(bars)), Enter)
+
+
+class FairValueGapTests(unittest.TestCase):
+    GAP = {"10:00": (100.00, 100.10, 99.90, 100.08),   # candle 1: high 100.10, low 99.90
+           "10:05": (100.10, 100.70, 100.05, 100.65),  # candle 2: big up candle (displacement)
+           "10:10": (100.65, 100.90, 100.40, 100.80)}  # candle 3: low 100.40 > 100.10 -> gap
+
+    def bars(self, extra=None):
+        o = {f"09:{m:02d}": (100.0, 100.05, 99.95, 100.0) for m in range(30, 60, 5)}
+        o |= {"09:55": (100.0, 100.05, 99.95, 100.0)} | self.GAP | (extra or {})
+        return day_bars(overrides=o)
+
+    def test_order_placed_when_the_gap_forms_at_its_midpoint(self):
+        bars = self.bars()
+        upto = [b for b in bars if b.ny_time <= "10:10"]
+        sig = FairValueGap().on_bar(ctx_for(upto))
+        self.assertIsInstance(sig, Enter)
+        self.assertAlmostEqual(sig.limit, 100.25)  # halfway between 100.10 and 100.40
+        self.assertEqual(sig.cancel_below, 100.10)
+        self.assertLess(sig.stop, 99.90)  # below candle 1's low
+        self.assertAlmostEqual(sig.target, 100.25 + 2 * (100.25 - sig.stop))
+        for i in range(3, len(upto) - 1):  # nothing before candle 3 has closed
+            self.assertIsNone(FairValueGap().on_bar(ctx_for(upto[: i + 1])))
+        small = dict(self.GAP)
+        small["10:05"] = (100.10, 100.18, 100.05, 100.15)  # no displacement candle
+        self.assertIsNone(FairValueGap().on_bar(ctx_for(
+            [b for b in self.bars(small) if b.ny_time <= "10:10"])))
+
+    def core_run(self, extra):
+        core = IntradayCore(FairValueGap(), ["SPY"], RiskParams())
+        return core.run_day(BotState.initial(1_000_000.0, DAY), DAY, {"SPY": self.bars(extra)},
+                            {"SPY": 100.0})
+
+    def test_resting_order_fills_only_when_price_trades_through_it(self):
+        res = self.core_run({"10:15": (100.80, 100.85, 100.50, 100.60),   # not back yet
+                             "10:20": (100.60, 100.62, 100.20, 100.30)})  # trades through 100.25
+        buy = res.fills[0]
+        self.assertEqual((buy.ts, buy.ref_price), (at(DAY, "10:20"), 100.25))
+        res = self.core_run({"10:15": (100.80, 100.85, 100.25, 100.60)})  # only touches it
+        self.assertFalse([f for f in res.fills if f.ts == at(DAY, "10:15")])
+
+    def test_order_cancelled_if_price_jumps_past_the_stop_or_never_returns(self):
+        res = self.core_run({"10:15": (99.50, 99.60, 99.40, 99.50)})  # opens below the stop
+        self.assertFalse(res.fills)
+        self.assertTrue(any("opened_below_stop" in g.reason for g in res.signals))
+        o = {f"{h:02d}:{m:02d}": (101.0, 101.05, 100.95, 101.0)
+             for h in range(10, 16) for m in range(0, 60, 5) if (h, m) > (10, 10)}
+        res = self.core_run(o)  # the price never comes back to the gap
+        self.assertFalse(res.fills)
+        self.assertTrue(any("too_close_to_the_close" in g.reason and g.outcome == "cancelled"
+                            for g in res.signals))
+
+    def test_target_not_assumed_in_the_bar_that_filled_the_order(self):
+        res = self.core_run({"10:15": (100.80, 103.00, 100.20, 100.70)})  # dip + spike in one bar
+        t = res.trades[0]
+        self.assertNotEqual((t.exit_reason, t.exit_ts), ("target_hit", at(DAY, "10:15")))
 
 
 class ParsingTests(unittest.TestCase):

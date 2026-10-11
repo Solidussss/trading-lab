@@ -23,10 +23,16 @@ from tradinglab.marketdata.intraday import IBar
 
 @dataclass(frozen=True)
 class Enter:
+    """Buy. With no `limit`: a market order at the next bar's open. With `limit`: a resting buy
+    order at that price, filled when a later bar trades down to it, and cancelled if a bar
+    closes below `cancel_below` or the entry window ends."""
+
     stop: float
     reason: str
     target: float | None = None
     diagnostics: Mapping[str, float] = field(default_factory=dict)
+    limit: float | None = None
+    cancel_below: float | None = None
 
 
 @dataclass(frozen=True)
@@ -252,8 +258,62 @@ class VwapTrend(IntradayStrategy):
         return None
 
 
+class FairValueGap(IntradayStrategy):
+    """Bullish fair value gap (FVG), as defined in discretionary day trading (often "ICT").
+
+    Pattern: three consecutive 5-minute candles 1, 2, 3 where candle 1's high is below candle 3's
+    low. Candle 2 is the "displacement": a large up candle. The range between candle 1's high
+    and candle 3's low is the gap. The trade: a resting buy order at the gap's midpoint (its
+    "consequent encroachment"), waiting for the price to come back.
+      * Displacement: candle 2 closes up and its range is at least 1.5x the day's average.
+      * Gap at least 0.05% of the price, formed after the first 15 minutes, with candle 3
+        closing above the day's average price (trade in the day's direction - a stand-in for the
+        "higher timeframe bias" discretionary traders use).
+      * Stop just below candle 1's low; target 2x the risk; sold by the close.
+      * The order is cancelled if a candle closes below the gap (the gap failed), or when the
+        entry window ends 30 minutes before the close.
+    The order sits from the moment candle 3 closes, so it can only fill on later prices.
+    """
+
+    id = "fvg"
+    name = "Fair value gap"
+    summary = ("After a sharp move up leaves a gap between candles, waits with a buy order in the "
+               "middle of the gap for the price to come back, betting the move resumes.")
+    rules = ("Looks for three 5-minute candles where the third one's low is above the first "
+             "one's high, with a big up candle in the middle. The price range in between is the "
+             "fair value gap.",
+             "Only counts gaps after the first 15 minutes, and only when the price is above the "
+             "day's average price.",
+             "Places a buy order at the middle of the gap and waits for the price to come back "
+             "to it.",
+             "Cancels the order if a candle closes below the gap. Safety stop just below the "
+             "first candle's low. Target twice the amount risked. Sells at the close if neither "
+             "is hit. Up to two trades per fund a day.")
+    max_entries_per_symbol = 2
+    defaults = {"min_gap": 0.0005, "displacement": 1.5, "entry_level": 0.5, "reward_risk": 2.0,
+                "stop_buffer": 0.1, "start_minutes": 15}
+
+    def on_bar(self, ctx: StrategyContext) -> Signal | None:
+        if ctx.position_entry is not None or len(ctx.bars) < 4:
+            return None
+        p = self.params
+        a, b, c = ctx.bars[-3], ctx.bars[-2], ctx.bars[-1]  # the gap is decided as c closes
+        bottom, top = a.high, c.low
+        avg = ctx.avg_range()
+        if not (top > bottom and a.ts >= ctx.open_utc + timedelta(minutes=p["start_minutes"])
+                and b.close > b.open and (b.high - b.low) >= p["displacement"] * avg
+                and (top - bottom) >= p["min_gap"] * c.close
+                and c.close > ctx.vwap_series()[-1]):
+            return None
+        entry = bottom + p["entry_level"] * (top - bottom)
+        stop = a.low - p["stop_buffer"] * avg
+        return Enter(stop, "fair_value_gap_order", target=entry + p["reward_risk"] * (entry - stop),
+                     limit=entry, cancel_below=bottom,
+                     diagnostics={"gap_bottom": bottom, "gap_top": top, "entry": entry})
+
+
 REGISTRY: dict[str, type[IntradayStrategy]] = {
-    cls.id: cls for cls in (OpeningRangeBreakout, GapFill, VwapDip, VwapTrend)
+    cls.id: cls for cls in (OpeningRangeBreakout, GapFill, VwapDip, VwapTrend, FairValueGap)
 }
 
 

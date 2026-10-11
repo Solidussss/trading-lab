@@ -52,6 +52,7 @@ ENTRY_WORDS = {
     "gap_down_open": "it opened lower than yesterday's close",
     "far_below_average": "it dropped unusually far below the day's average price",
     "bounce_off_rising_average": "it bounced off the day's rising average price",
+    "fair_value_gap_order": "the price came back to the middle of a fair value gap",
 }
 REJECT_WORDS = {
     "too_close_to_the_close": "it was too close to the end of the day",
@@ -66,6 +67,7 @@ REJECT_WORDS = {
     "not_enough_cash": "there wasn't enough cash left",
     "opened_below_stop": "the price opened below the safety stop",
     "opened_above_target": "the price had already reached the target",
+    "gap_failed": "the price closed below the gap, so the gap failed",
 }
 
 
@@ -484,6 +486,11 @@ def timeline(r: DayResult, tz) -> str:
                          f"({money(t.costs)} of that was trading costs).")
             items.append((f.ts, text))
     for g in r.signals:
+        if g.outcome == "ordered" and g.action == "enter" and g.diagnostics.get("limit"):
+            items.append((g.ts + timedelta(minutes=5), f"Spotted a fair value gap in {g.symbol} "
+                          f"between {money(g.diagnostics.get('gap_bottom', 0))} and "
+                          f"{money(g.diagnostics.get('gap_top', 0))}. Placed a buy order at "
+                          f"{money(g.diagnostics['limit'])}, waiting for the price to come back."))
         if g.outcome == "rejected" and g.symbol != "*" and g.action == "enter":
             items.append((g.ts, f"Saw a reason to buy {g.symbol} but didn't, because "
                                 f"{_reason(g.reason, REJECT_WORDS)}."))
