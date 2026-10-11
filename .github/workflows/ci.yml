@@ -10,6 +10,15 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:  # real PostgreSQL for the store tests (trust auth, test-only)
+        image: postgres:16
+        env:
+          POSTGRES_USER: tl
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tl" --health-interval 5s --health-timeout 5s --health-retries 10
     strategy:
       matrix:
         python: ["3.12"]
@@ -28,6 +37,7 @@ jobs:
         env:
           # No real credentials in CI: the suite uses obviously fake tokens and no network.
           PYTHONHASHSEED: "0"
+          TL_TEST_PG: "127.0.0.1:55432"
         run: pytest
       - name: Refuse committed secrets
         run: |

@@ -11,9 +11,9 @@ no brokerage connection and no real-money trading code; see `docs/SAFETY.md`.
 | 1 | Project structure, fail-closed config, egress allowlist, network guard, self-check | ✅ done, tested |
 | 2 | NYSE calendar, data layer + checksummed cache, trend following v1, backtester, costs, splits, walk-forward, test vault, metrics, reports | ✅ done, tested on synthetic data |
 | 3 | Simulation core shared by backtests and live engine; live engine with catch-up, idempotency, evidence-based data gaps, atomic commits, pause, manual drawdown resume; Tiingo client | ✅ done, tested (incl. exact live/backtest parity); independently audited |
-| 4 | PostgreSQL store (same interface as the in-memory store) + migrations | next |
-| 5 | Railway: dashboard/API service + nightly job, restart/recovery, monitoring | |
-| 6 | Authenticated mobile dashboard | |
+| 4 | PostgreSQL store + migrations, advisory-lock run lock | ✅ done, tested against real PostgreSQL |
+| 5 | Railway service: in-app scheduler (15-min idempotent checks), nightly CLI, restart/catch-up | ✅ done |
+| 6 | Authenticated mobile dashboard | 🟡 Overview + controls live; Activity, Strategies, Analytics, Research pages next |
 | 7 | Momentum and mean-reversion strategies | |
 | 8 | Claude research reports (scheduled / on demand only) | |
 
@@ -51,7 +51,14 @@ Tiingo EOD API ──► marketdata/tiingo.py ──► BarSource
    - `DASHBOARD_PASSWORD` = a password of at least 12 characters (you log in with any
      username and this password)
    - `TIINGO_API_TOKEN` = your Tiingo token
+   - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}` (after adding PostgreSQL: **+ New →
+     Database → PostgreSQL**). Add only this one; the app refuses libpq `PG*` variables.
 3. Service → Settings → Networking → Generate Domain. Open it on your phone.
+
+Once the database is attached, the web service checks every 15 minutes and processes each
+trading day after it settles (8:30 pm ET or later). The first run starts a fresh $10,000
+portfolio at the latest settled session. `python main.py nightly` runs one check and exits,
+if you prefer a separate Railway cron service.
 
 Do not add brokerage or proxy variables: the app refuses to start its trading functions
 if it sees them.

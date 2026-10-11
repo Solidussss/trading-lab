@@ -94,3 +94,132 @@ class WebTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DashboardTests(unittest.TestCase):
+    """Overview rendering with a real simulated portfolio, controls, and scheduler."""
+
+    @classmethod
+    def setUpClass(cls):
+        from datetime import date
+
+        from tests.test_live_engine import FlakySource, DATA, evening
+        from tradinglab.engine.live import LiveSimulationEngine
+        from tradinglab.engine.store import InMemoryStore
+        from tradinglab.marketdata.calendar import trading_days
+        from tradinglab.strategies.trend_following import TrendFollowing
+        from tests.helpers import settings
+
+        cls.store = InMemoryStore()
+        cls.engine = LiveSimulationEngine(settings(), cls.store, FlakySource(DATA),
+                                          TrendFollowing.create())
+        for d in trading_days(date(2019, 1, 2), date(2019, 9, 30)):
+            cls.engine.run(evening(d))
+
+    def start(self, **kw):
+        base = valid_env(DASHBOARD_PASSWORD=PASSWORD, TIINGO_API_TOKEN=FAKE_TIINGO_TOKEN)
+        state = AppState(base, freeze=False, system_proxies=dict, store=self.store,
+                         controls=self.engine, **kw)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return httpd.server_address[1], state
+
+    def post(self, port, body, origin="same", password=PASSWORD):
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        headers = {"Content-Type": "application/x-www-form-urlencoded",
+                   "Authorization": "Basic " + base64.b64encode(f"me:{password}".encode()).decode()}
+        if origin == "same":
+            headers["Origin"] = f"http://127.0.0.1:{port}"
+        elif origin:
+            headers["Origin"] = origin
+        conn.request("POST", "/control", body=body, headers=headers)
+        r = conn.getresponse()
+        r.read()
+        conn.close()
+        return r.status
+
+    def test_overview_shows_portfolio(self):
+        port, _ = self.start()
+        status, body, _ = WebTests.get(self, port, password=PASSWORD)
+        self.assertEqual(status, 200)
+        for text in ("Portfolio", "Equity", "Total P&amp;L", "Open positions",
+                     "Orders for the next open", "Latest decisions", "Recent trades",
+                     "Engine", "Activity log", "System &amp; safety", "<svg"):
+            self.assertIn(text, body)
+        st = self.store.load_state()
+        self.assertIn(f"{st.last_session.strftime('%a %b %d, %Y')} close", body)
+        self.assertNotIn("sma_fast", body)  # reasons are shown in plain English
+        if self.store.trades():
+            self.assertIn(self.store.trades()[-1].symbol, body)
+
+    def test_controls_pause_and_resume_with_csrf(self):
+        port, state = self.start()
+        self.assertEqual(self.post(port, f"action=pause&csrf={state.csrf}"), 303)
+        self.assertTrue(self.store.get_flag("paused"))
+        _, body, _ = WebTests.get(self, port, password=PASSWORD)
+        self.assertIn("Resume new entries", body)
+        self.assertEqual(self.post(port, f"action=resume&csrf={state.csrf}"), 303)
+        self.assertFalse(self.store.get_flag("paused"))
+
+    def test_controls_reject_forgery(self):
+        port, state = self.start()
+        good = f"action=pause&csrf={state.csrf}"
+        self.assertEqual(self.post(port, "action=pause&csrf=wrong"), 403)
+        self.assertEqual(self.post(port, good, origin=None), 403)
+        self.assertEqual(self.post(port, good, origin="https://evil.example"), 403)
+        self.assertEqual(self.post(port, good, password="not-the-password!"), 401)
+        self.assertEqual(self.post(port, f"action=selfdestruct&csrf={state.csrf}"), 400)
+        self.assertFalse(self.store.get_flag("paused"))
+
+    def test_empty_portfolio_message(self):
+        from tradinglab.engine.store import InMemoryStore
+
+        state = AppState(valid_env(DASHBOARD_PASSWORD=PASSWORD), freeze=False,
+                         system_proxies=dict, store=InMemoryStore())
+        from tradinglab.web.server import render_page
+
+        self.assertIn("starts on the", render_page(state))
+
+    def test_build_state_waits_for_database(self):
+        from tradinglab.web import server
+
+        orig = server.AppState
+        server.AppState = lambda env: orig(env, freeze=False, system_proxies=dict)
+        try:
+            state = server.build_state(valid_env(DASHBOARD_PASSWORD=PASSWORD,
+                                                 TIINGO_API_TOKEN=FAKE_TIINGO_TOKEN))
+        finally:
+            server.AppState = orig
+        self.assertIsNone(state.store)
+        self.assertIn("DATABASE_URL", state.engine_note)
+
+
+class SchedulerTests(unittest.TestCase):
+    def test_check_once_records_report_and_recovers_from_errors(self):
+        from datetime import UTC, datetime
+
+        from tradinglab.engine.live import RunReport
+        from tradinglab.engine.runtime import Scheduler
+
+        calls = {"built": 0, "runs": 0}
+
+        class FakeEngine:
+            def run(self, now):
+                calls["runs"] += 1
+                if calls["runs"] == 2:
+                    raise ConnectionError("db went away")
+                return RunReport("up_to_date", None)
+
+        def factory():
+            calls["built"] += 1
+            return FakeEngine()
+
+        s = Scheduler(factory, clock=lambda: datetime(2026, 10, 10, tzinfo=UTC))
+        self.assertEqual(s.check_once().status, "up_to_date")
+        self.assertIsNone(s.check_once())
+        self.assertIn("db went away", s.status.last_error)
+        self.assertEqual(s.check_once().status, "up_to_date")  # rebuilt after the error
+        self.assertEqual(calls["built"], 2)
+        self.assertIsNone(s.status.last_error)
