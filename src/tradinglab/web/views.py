@@ -483,7 +483,8 @@ def controls_section(state: Any, snap: Snapshot | None) -> str:
         "pause", "Pause new buys", "secondary")
     if latched:
         btns += form("resume_drawdown", "Resume buying after the drop", "primary")
-    text = ("Paused: no new buys. Safety stops still protect anything held." if paused else
+    text = ("Paused. No new buys until you tap Resume buying. Safety stops still protect anything "
+            "held." if paused else
             "Pausing stops new buys. Anything already held keeps its safety stop.")
     return f"<section class='controls'><h2>Controls</h2><p class='quiet'>{text}</p><div class='btns'>{btns}</div></section>"
 
@@ -533,8 +534,8 @@ font-variant-numeric:tabular-nums}
 border:1px solid var(--line)}
 .fund header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
 .fund header p{margin:6px 0 0}
-.badge{font:600 13px/1 var(--body);padding:7px 10px;border-radius:99px;white-space:nowrap;
-border:1.5px solid currentColor}
+.badge{font:600 14px/1.2 var(--body);white-space:nowrap;padding-top:4px;display:flex;align-items:center;gap:7px}
+.badge::before{content:'';width:9px;height:9px;border-radius:50%;background:currentColor}
 .badge.watch{color:var(--quiet)} .badge.hold{color:var(--gain)} .badge.buy{color:var(--buy)}
 .badge.sell{color:var(--loss)} .badge.warn{color:var(--warn)}
 .pxrow{display:flex;align-items:baseline;gap:10px;margin:14px 0 4px}
@@ -562,19 +563,26 @@ border-radius:50%;background:var(--bg);border:2px solid var(--quiet)}
 .timeline time{font:650 15px/1.4 var(--display)}
 .timeline ul{margin:2px 0 0;padding:0;list-style:none}
 .timeline ul li{margin:2px 0}
-details{margin-top:8px}
-summary{cursor:pointer;font:650 18px/1.3 var(--display);padding:6px 0}
+details{margin-top:8px;background:var(--surface);border:1px solid var(--line);border-radius:12px}
+summary{cursor:pointer;font:650 18px/1.3 var(--display);padding:16px;list-style:none;display:flex;
+justify-content:space-between;align-items:center;gap:12px}
+summary::-webkit-details-marker{display:none}
+summary::after{content:'Show';font:600 14px/1 var(--body);color:var(--teal);white-space:nowrap}
+details[open] summary::after{content:'Hide'}
+.how{padding:0 16px 14px}
 .how p,.how li{max-width:38em} .how ul{padding-left:20px}
 .btns{display:flex;gap:10px;flex-wrap:wrap}
 button{font:600 16px/1 var(--body);padding:13px 18px;border-radius:10px;min-height:46px;cursor:pointer;
 border:1.5px solid var(--ink);background:transparent;color:var(--ink)}
 button.primary{background:var(--ink);color:var(--bg)}
+button:hover{background:var(--ink);color:var(--bg)} button:active{transform:translateY(1px)}
 button:focus-visible,summary:focus-visible{outline:3px solid var(--teal);outline-offset:2px}
 footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);font-size:14px}
 footer p{margin:0 0 6px}
 footer .ok{color:var(--gain)}
-footer summary{font:600 14px/1.3 var(--body);color:var(--quiet)}
-.tech{padding-left:0;list-style:none;color:var(--quiet);font-size:13px;word-break:break-word}
+footer details{background:none;border:0}
+footer summary{font:600 14px/1.3 var(--body);color:var(--quiet);padding:6px 0;justify-content:flex-start}
+.tech{padding:0 0 0 0;list-style:none;color:var(--quiet);font-size:13px;word-break:break-word}
 """
 
 FONTS = ("https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..700"
