@@ -156,6 +156,7 @@ class PortfolioState:
     drawdown_halt_latched: bool = False
     realized_pnl: float = 0.0
     dividends_received: float = 0.0
+    config_fingerprint: str = ""  # symbols + strategy spec + risk + costs it was run with
 
     @classmethod
     def initial(cls, capital: float) -> PortfolioState:
@@ -190,8 +191,10 @@ class PortfolioState:
             positions[k] = SimPosition(**{**p, "entry_day": day(p["entry_day"])})
         pending = [PendingOrder(**{**o, "decided_on": day(o["decided_on"])})
                    for o in d["pending"]]
-        rest = {k: v for k, v in d.items() if k not in ("positions", "pending", "last_session")}
-        return cls(positions=positions, pending=pending, last_session=day(d["last_session"]),
+        known = {f for f in cls.__dataclass_fields__}
+        rest = {k: v for k, v in d.items()
+                if k in known and k not in ("positions", "pending", "last_session")}
+        return cls(positions=positions, pending=pending, last_session=day(d.get("last_session")),
                    **rest)
 
 
@@ -218,7 +221,10 @@ class SimulationCore:
             raise ValueError(f"session {day} already processed (last {state.last_session})")
         res = StepResult(day)
         costs, label = self.costs, self.strategy.spec.label
-        todays = {s: bars.get(s) for s in self.symbols}
+        # Held symbols are always managed (stops, marks, exits) even if they were removed
+        # from the configured list; they just never receive new entries.
+        symbols = self.symbols + sorted(s for s in state.positions if s not in self.symbols)
+        todays = {s: bars.get(s) for s in symbols}
 
         # ---- 0. corporate actions -----------------------------------------------------
         for sym, bar in todays.items():
@@ -325,10 +331,12 @@ class SimulationCore:
         # ---- 4. after close: decisions for the next session -----------------------------
         reserved_cash = pending_exposure = 0.0
         pending_entries = 0
-        for sym in self.symbols:
+        for sym in symbols:
             bar, p = todays[sym], state.positions.get(sym)
             if bar is None:
                 res.decisions.append(Decision(day, sym, "none", "data_gap", "no_bar_today"))
+                continue
+            if sym not in self.symbols and p is None:
                 continue
             if p is not None:
                 p.bars_held += 1
@@ -359,6 +367,10 @@ class SimulationCore:
                                               sig.reason, shares=p.shares,
                                               diagnostics=sig.diagnostics))
             elif sig.action == Action.ENTER_LONG and p is None:
+                if sym not in self.symbols:
+                    res.decisions.append(Decision(day, sym, sig.action.value, "rejected",
+                                                  "symbol_not_configured"))
+                    continue
                 if entries_blocked:
                     res.decisions.append(Decision(day, sym, sig.action.value, "rejected",
                                                   ";".join(block_reasons),
@@ -418,6 +430,17 @@ class SimulationCore:
         return res
 
     @staticmethod
+    def skip_session(state: PortfolioState, day: date, reason: str) -> StepResult:
+        """Record a session the market did not trade (e.g. an unscheduled closure).
+        No fills, no stops, no decisions; pending orders carry over to the next session."""
+        if state.last_session is not None and day <= state.last_session:
+            raise ValueError(f"session {day} already processed")
+        res = StepResult(day)
+        res.decisions.append(Decision(day, "*", "none", "session_skipped", reason))
+        state.last_session = day
+        return res
+
+    @staticmethod
     def resume_after_drawdown(state: PortfolioState) -> None:
         """Manual resume (live): the current equity becomes the new drawdown baseline."""
         state.drawdown_halt_latched = False
@@ -449,18 +472,22 @@ class SimulationCore:
     def _apply_split(self, state: PortfolioState, sym: str, bar: Bar, res: StepResult) -> None:
         f = bar.split
         p = state.positions.get(sym)
+        if p is not None and math.floor(p.shares * f + 1e-9) <= 0:
+            # A reverse split leaves less than one share: paid out entirely as cash in lieu,
+            # at the pre-split equivalent of today's open. Recorded as a normal trade.
+            ref = bar.open * f
+            self._close(state, p, bar.day, ref, ref, "split_cash_in_lieu", res)
+            p = None
         if p is not None:
             new_shares = math.floor(p.shares * f + 1e-9)
             cash_in_lieu = (p.shares * f - new_shares) * bar.open
             state.cash += cash_in_lieu
+            p.dividends += cash_in_lieu  # income while held: counted in the trade's P&L
             p.shares = new_shares
             for attr in ("entry_price", "entry_ref", "stop", "initial_stop", "highest_close"):
                 setattr(p, attr, getattr(p, attr) / f)
-            p.entry_fees = p.entry_fees  # unchanged (dollar amount)
-            if sym in state.last_close:
-                state.last_close[sym] /= f
-            if new_shares <= 0:
-                del state.positions[sym]
+        if sym in state.last_close:
+            state.last_close[sym] /= f
         for o in state.pending:
             if o.symbol == sym:
                 o.shares = math.floor(o.shares * f + 1e-9)

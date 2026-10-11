@@ -10,7 +10,7 @@ no brokerage connection and no real-money trading code; see `docs/SAFETY.md`.
 |---|---|---|
 | 1 | Project structure, fail-closed config, egress allowlist, network guard, self-check | ✅ done, tested |
 | 2 | NYSE calendar, data layer + checksummed cache, trend following v1, backtester, costs, splits, walk-forward, test vault, metrics, reports | ✅ done, tested on synthetic data |
-| 3 | Simulation core shared by backtests and live engine; live engine with catch-up, idempotency, data waits, atomic commits, pause, manual drawdown resume; Tiingo client | ✅ done, tested (incl. exact live/backtest parity) |
+| 3 | Simulation core shared by backtests and live engine; live engine with catch-up, idempotency, evidence-based data gaps, atomic commits, pause, manual drawdown resume; Tiingo client | ✅ done, tested (incl. exact live/backtest parity); independently audited |
 | 4 | PostgreSQL store (same interface as the in-memory store) + migrations | next |
 | 5 | Railway: dashboard/API service + nightly job, restart/recovery, monitoring | |
 | 6 | Authenticated mobile dashboard | |

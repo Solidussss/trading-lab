@@ -59,9 +59,17 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(is_brokerage_host("notalpaca.markets.example.com"))
         self.assertTrue(is_brokerage_host("x.y.alpaca.markets"))
 
+    def test_hostname_charset(self):
+        for h in ("api.tiingo.com\x00.localhost", "api tiingo.com", "a/b.com", "a@b.com", "x%00.com"):
+            with self.subTest(h=repr(h)), self.assertRaises(EgressDeniedError):
+                self.p.check(h)
+
     def test_freeze(self):
         self.p.allow(["db.internal"])
         self.p.freeze()
+        with self.assertRaises(EgressDeniedError):
+            self.p.allow(["new.host"])
+        self.p._frozen = False  # even flipping the flag back does not unfreeze the set
         with self.assertRaises(EgressDeniedError):
             self.p.allow(["new.host"])
         self.assertEqual(self.p.check("db.internal"), "db.internal")

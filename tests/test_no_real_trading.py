@@ -103,6 +103,81 @@ class B_NetworkTests(unittest.TestCase):
             with self.subTest(handler=handler.proxies), self.assertRaises(BrokerageForbiddenError):
                 opener.open("https://api.alpaca.markets/v2/orders", timeout=2)
 
+    def test_connect_to_ip_resolved_from_allowlisted_name_is_allowed(self):
+        # Auditor finding #1: sockets connect to the resolved IP, not the name. With DNS
+        # faked, a connection to api.tiingo.com must pass the guard; any other public IP
+        # must still be refused.
+        from unittest import mock
+
+        import tradinglab.safety.network_guard as ng
+
+        fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("52.4.53.104", 443))]
+        with mock.patch.object(ng, "_real_getaddrinfo", return_value=fake):
+            res = socket.getaddrinfo("api.tiingo.com", 443)
+        self.assertEqual(res, fake)
+        self.assertEqual(ng.resolved_ips().get("52.4.53.104"), "api.tiingo.com")
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            _audit_hook("socket.connect", (s, ("52.4.53.104", 443)))  # allowed
+            with self.assertRaises(EgressDeniedError):
+                _audit_hook("socket.connect", (s, ("52.4.53.105", 443)))
+        finally:
+            s.close()
+
+    def test_resolution_of_brokerage_name_records_nothing(self):
+        from unittest import mock
+
+        import tradinglab.safety.network_guard as ng
+
+        fake = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("34.1.2.3", 443))]
+        with mock.patch.object(ng, "_real_getaddrinfo", return_value=fake), \
+                self.assertRaises(BrokerageForbiddenError):
+            socket.getaddrinfo("api.alpaca.markets", 443)
+        self.assertNotIn("34.1.2.3", ng.resolved_ips())
+
+    def test_bytes_hostnames_and_sendto_are_checked(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            with self.assertRaises(BrokerageForbiddenError):
+                _audit_hook("socket.connect", (s, (b"api.alpaca.markets", 443)))
+            with self.assertRaises(EgressDeniedError):
+                u.sendto(b"x", ("8.8.8.8", 53))
+            with self.assertRaises(BrokerageForbiddenError):
+                _audit_hook("socket.sendto", (u, ("api.ibkr.com", 443)))
+            with self.assertRaises(EgressDeniedError):
+                _audit_hook("socket.sendmsg", (u, ("8.8.8.8", 443)))
+            _audit_hook("socket.sendto", (u, None))  # connected socket: no address
+        finally:
+            s.close()
+            u.close()
+
+    def test_unparseable_addresses_are_denied_not_allowed(self):
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            for addr in (object(), 12345, (), (b"\xff\xfe", 443)):
+                with self.subTest(addr=addr), self.assertRaises(EgressDeniedError):
+                    _audit_hook("socket.connect", (s, addr))
+        finally:
+            s.close()
+
+    def test_unix_sockets_are_local_ipc(self):
+        if not hasattr(socket, "AF_UNIX"):
+            self.skipTest("no AF_UNIX")
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            _audit_hook("socket.connect", (s, "/var/run/postgresql/.s.PGSQL.5432"))
+        finally:
+            s.close()
+
+    def test_nul_and_metadata_tricks_refused(self):
+        for host in ("api.alpaca.markets\x00.localhost", "8.8.8.8\x00.localhost"):
+            with self.subTest(host=repr(host)), self.assertRaises(EgressDeniedError):
+                socket.getaddrinfo(host, 443)
+        for ip in ("169.254.169.254", "0.0.0.0", "198.18.0.1", "2002::1"):
+            with self.subTest(ip=ip), self.assertRaises(EgressDeniedError):
+                socket.getaddrinfo(ip, 80)
+
     def test_allowed_hosts_not_intercepted(self):
         for host in ("api.tiingo.com", "api.anthropic.com", "localhost"):
             with self.subTest(host=host):
@@ -141,6 +216,7 @@ class C_SourceCodeTests(unittest.TestCase):
                          r"websocket|websockets|socket|anthropic)(\.|$)")
         allowed = {SRC / "marketdata" / "tiingo.py": {"urllib.request"},
                    SRC / "safety" / "selfcheck.py": {"socket", "urllib.request"},
+                   SRC / "safety" / "network_guard.py": {"socket"},
                    SRC / "research" / "claude.py": {"anthropic"}}
         offenders = []
         for p in py_files():

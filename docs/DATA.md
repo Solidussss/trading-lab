@@ -41,9 +41,17 @@ whose terms explicitly allow storing data for internal use; only `marketdata/` c
   open/high/low of D+1 — so they are settled in the evening run after D+1.
 - **Corporate actions are explicit.** Cash dividends are credited on ex-dates to positions
   held at the prior close; splits rescale positions. Strategies see a split-adjusted view.
-- **Missing data:** if a session's bar is missing, the engine waits; after two sessions it
-  proceeds and records a data gap (e.g. an unscheduled closure). Bars on days the NYSE
-  calendar marks closed are flagged and ignored. Every session stores the exact bars used.
+- **Missing or suspect data — never invented, never silently discarded:**
+  - a symbol's missing bar is accepted as a gap only once the provider has delivered later
+    sessions for it; until then the engine waits (and flags a stall after 3 sessions);
+  - if every symbol is missing a day but later data exists, the day is treated as an
+    unscheduled market closure and skipped;
+  - a row the validator rejects, or an overnight move beyond ±35% without a recorded split,
+    blocks processing until the provider corrects it or you acknowledge it on the dashboard;
+  - bars on days the NYSE calendar marks closed are flagged and ignored;
+  - every session stores the exact bars used.
+- **Settling:** a session is processed 4.5 h after its close and never before 8:30 pm ET
+  (Tiingo's corrections run until ~8 pm ET, including on early-close days).
 - **Revisions:** fills are final once processed (as in real trading). Research datasets are
   cached with SHA-256 checksums so backtests are reproducible.
 - **Intraday prices:** not used by the V1 strategy. Tiingo's free IEX endpoint returns a

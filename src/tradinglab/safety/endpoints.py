@@ -17,6 +17,7 @@ look-alikes, trailing dots, ports, case and zero-width characters cannot disguis
 from __future__ import annotations
 
 import ipaddress
+import re
 from collections.abc import Iterable
 from typing import Final
 from urllib.parse import urlsplit
@@ -45,6 +46,19 @@ BROKERAGE_DOMAINS: Final[frozenset[str]] = frozenset(
 )
 
 
+# Hostname characters after IDNA normalisation. Anything else (NUL bytes, spaces, slashes,
+# '@', '%') is refused: C resolvers truncate at NUL, so "api.alpaca.markets\x00.localhost"
+# would otherwise pass a suffix check and resolve the brokerage host.
+_HOSTNAME_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+
+# IP literals that may be contacted directly: loopback and private networks (Railway's
+# private network is IPv6 ULA, fd00::/8). Link-local (incl. the 169.254.169.254 cloud
+# metadata service), 0.0.0.0, benchmark and 6to4 ranges are NOT included.
+ALLOWED_IP_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    "127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fd00::/8",
+))
+
+
 class BrokerageForbiddenError(RuntimeError):
     """Raised whenever anything attempts to reach a brokerage or trading venue."""
 
@@ -63,10 +77,18 @@ def normalize_host(host: str) -> str:
             raise EgressDeniedError("Unconvertible non-ASCII hostname refused.") from exc
     h = h.lower()
     if h.startswith("[") and "]" in h:  # IPv6 literal
-        return h[1 : h.index("]")]
-    if h.count(":") == 1:
+        h = h[1 : h.index("]")]
+    elif h.count(":") == 1:
         h = h.split(":", 1)[0]
-    return h.rstrip(".")
+    h = h.rstrip(".")
+    if _ip(h) is None and h and not _HOSTNAME_RE.match(h):
+        raise EgressDeniedError("Hostname contains characters that are not allowed.")
+    return h
+
+
+def is_allowed_ip(host: str) -> bool:
+    ip = _ip(host)
+    return ip is not None and any(ip in net for net in ALLOWED_IP_NETWORKS)
 
 
 def is_brokerage_host(host: str) -> bool:
@@ -94,13 +116,14 @@ class EgressPolicy:
         for h in normalized:
             if is_brokerage_host(h):
                 raise BrokerageForbiddenError(f"Refusing to allow brokerage host {h!r}.")
-        new = set(normalized) - self._allowed
-        if new and self._frozen:
+        new = set(normalized) - set(self._allowed)
+        if new and (self._frozen or isinstance(self._allowed, frozenset)):
             raise EgressDeniedError("Egress policy is frozen; refusing to widen it.")
         self._allowed |= new
 
     def freeze(self) -> None:
         self._frozen = True
+        self._allowed = frozenset(self._allowed)  # type: ignore[assignment]
 
     @property
     def frozen(self) -> bool:
@@ -119,11 +142,10 @@ class EgressPolicy:
             raise BrokerageForbiddenError(f"Refusing to connect to brokerage host {h!r}.")
         if h == "localhost" or h.endswith(".localhost"):
             return h
-        ip = _ip(h)
-        if ip is not None:
-            if ip.is_loopback or ip.is_private or ip.is_link_local:
+        if _ip(h) is not None:
+            if is_allowed_ip(h):
                 return h
-            raise EgressDeniedError(f"Public IP literal {h!r} cannot be verified; refused.")
+            raise EgressDeniedError(f"IP literal {h!r} is not a resolved allowlisted host; refused.")
         if h in self._allowed:
             return h
         raise EgressDeniedError(f"Host {h!r} is not on the egress allowlist.")

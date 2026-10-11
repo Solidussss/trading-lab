@@ -326,6 +326,48 @@ class TiingoClientTests(unittest.TestCase):
         self.assertEqual(len(s), 1)
         self.assertIn("bad_ohlc", {i.kind for i in s.issues})
 
+    def test_redirects_are_refused(self):
+        from tradinglab.marketdata.tiingo import DataProviderError
+
+        c, calls = self.client([(302, b"", {"Location": "http://evil.example/steal"})])
+        with self.assertRaises(DataProviderError) as ctx:
+            c.daily("SPY", date(2026, 10, 1), date(2026, 10, 9))
+        self.assertIn("redirect", str(ctx.exception))
+        self.assertEqual(len(calls), 1)
+
+    def test_real_opener_does_not_follow_redirects(self):
+        import urllib.request
+
+        from tradinglab.marketdata.tiingo import _NoRedirect
+
+        req = urllib.request.Request("https://api.tiingo.com/x",
+                                     headers={"Authorization": "Token secret"})
+        self.assertIsNone(_NoRedirect().redirect_request(req, None, 302, "Found", {},
+                                                         "http://evil.example/"))
+
+    def test_retry_after_is_honoured_or_ends_the_run(self):
+        import json as _json
+
+        from tradinglab.marketdata.tiingo import DataProviderError
+
+        slept = []
+        c, _ = self.client([(429, b"", {"Retry-After": "30"}),
+                            (200, _json.dumps([self.ROW]).encode())])
+        c._sleep = slept.append
+        c.daily("SPY", date(2026, 10, 1), date(2026, 10, 9))
+        self.assertEqual(slept, [30.0])
+        c, calls = self.client([(429, b"", {"Retry-After": "3600"})])
+        with self.assertRaises(DataProviderError):
+            c.daily("SPY", date(2026, 10, 1), date(2026, 10, 9))
+        self.assertEqual(len(calls), 1)  # does not burn the hourly quota retrying
+
+    def test_oversized_response_refused(self):
+        from tradinglab.marketdata.tiingo import MAX_RESPONSE_BYTES, DataProviderError
+
+        c, _ = self.client([(200, b"[" + b" " * MAX_RESPONSE_BYTES + b"]")])
+        with self.assertRaises(DataProviderError):
+            c.daily("SPY", date(2026, 10, 1), date(2026, 10, 9))
+
     def test_rate_limiter(self):
         t = [0.0]
         slept = []

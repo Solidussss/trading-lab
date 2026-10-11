@@ -104,17 +104,93 @@ class DataHandlingTests(unittest.TestCase):
         rep = eng.run(evening(date(2019, 3, 15)) + timedelta(hours=2))
         self.assertEqual(rep.processed, [date(2019, 3, 15)])
 
-    def test_persistent_gap_is_accepted_and_recorded(self):
+    def test_single_symbol_gap_accepted_once_provider_has_moved_on(self):
         source = FlakySource(DATA)
         source.drop = {("QQQ", date(2019, 3, 12))}
         eng, store, _ = engine(source)
         eng.run(evening(date(2019, 3, 8)))
-        rep = eng.run(evening(date(2019, 3, 14)))  # gap is 2 sessions old by now
+        rep = eng.run(evening(date(2019, 3, 14)))  # QQQ has bars after 3/12
         self.assertIn(date(2019, 3, 12), rep.processed)
         kinds = [e.kind for e in store.events()]
         self.assertIn("data_gap_accepted", kinds)
         self.assertTrue(any(x.outcome == "data_gap" and x.symbol == "QQQ"
                             for x in store.decisions()))
+
+    def test_stalled_provider_never_commits_empty_sessions(self):
+        # Auditor probe p9: provider two+ sessions behind must not produce empty sessions.
+        source = FlakySource(DATA, published_through=date(2019, 3, 11))
+        eng, store, _ = engine(source)
+        eng.run(evening(date(2019, 3, 8)))
+        for d in trading_days(date(2019, 3, 12), date(2019, 3, 19)):
+            rep = eng.run(evening(d))
+        self.assertEqual(store.load_state().last_session, date(2019, 3, 11))
+        self.assertEqual(rep.status, "waiting_for_data")
+        self.assertIn("stalled", store.events()[-1].detail)
+        self.assertFalse(any(x.outcome == "data_gap" for x in store.decisions()))
+        source.published_through = None  # provider catches up: real bars are used
+        rep = eng.run(evening(date(2019, 3, 19)) + timedelta(hours=1))
+        self.assertEqual(rep.processed, trading_days(date(2019, 3, 12), date(2019, 3, 19)))
+        self.assertEqual(store.bars_used(date(2019, 3, 12))["SPY"],
+                         DATA["SPY"].bar_on(date(2019, 3, 12)))
+
+    def test_all_symbols_missing_with_later_data_is_a_market_closure(self):
+        source = FlakySource(DATA)
+        closed = date(2019, 3, 13)
+        source.drop = {(s, closed) for s in SYMS}
+        eng, store, _ = engine(source)
+        eng.run(evening(date(2019, 3, 11)))
+        rep = eng.run(evening(date(2019, 3, 15)))
+        self.assertIn(closed, rep.processed)
+        self.assertIn("session_skipped", [e.kind for e in store.events()])
+        self.assertFalse(any(x.day == closed and x.outcome == "data_gap"
+                             for x in store.decisions()))
+        self.assertEqual(store.load_state().last_session, date(2019, 3, 15))
+
+    def test_rejected_provider_row_blocks_until_acknowledged(self):
+        from tradinglab.marketdata.bars import Bar
+
+        bad_day = date(2019, 3, 13)
+        data = dict(DATA)
+        b = DATA["SPY"].bar_on(bad_day)
+        data["SPY"] = BarSeries("SPY", [x if x.day != bad_day else
+                                        Bar(b.day, b.open, b.open * 0.5, b.low, b.close, b.volume)
+                                        for x in DATA["SPY"].bars])
+        eng, store, _ = engine(FlakySource(data))
+        eng.run(evening(date(2019, 3, 11)))
+        rep = eng.run(evening(date(2019, 3, 15)))
+        self.assertEqual(rep.status, "blocked")
+        self.assertEqual(store.load_state().last_session, date(2019, 3, 12))
+        eng.acknowledge_anomaly("SPY", bad_day)
+        rep = eng.run(evening(date(2019, 3, 15)) + timedelta(hours=1))
+        self.assertEqual(rep.processed[-1], date(2019, 3, 15))
+
+    def test_unrecorded_split_like_jump_blocks(self):
+        from tradinglab.marketdata.bars import Bar
+
+        jump = date(2019, 3, 13)
+        bars = [x if x.day < jump else Bar(x.day, x.open / 2, x.high / 2, x.low / 2,
+                                            x.close / 2, x.volume * 2)
+                for x in DATA["IWM"].bars]  # a 2:1 split whose splitFactor row is missing
+        data = {**DATA, "IWM": BarSeries("IWM", bars)}
+        eng, store, _ = engine(FlakySource(data))
+        eng.run(evening(date(2019, 3, 11)))
+        rep = eng.run(evening(date(2019, 3, 15)))
+        self.assertEqual(rep.status, "blocked")
+        self.assertIn("without a matching recorded split", rep.messages[0])
+
+    def test_recorded_split_does_not_block(self):
+        from tradinglab.marketdata.bars import Bar
+
+        split_day = date(2019, 3, 13)
+        bars = [x if x.day < split_day else Bar(x.day, x.open / 2, x.high / 2, x.low / 2,
+                                                 x.close / 2, x.volume * 2, 0.0,
+                                                 2.0 if x.day == split_day else 1.0)
+                for x in DATA["IWM"].bars]
+        data = {**DATA, "IWM": BarSeries("IWM", bars)}
+        eng, store, _ = engine(FlakySource(data))
+        eng.run(evening(date(2019, 3, 11)))
+        rep = eng.run(evening(date(2019, 3, 15)))
+        self.assertEqual(rep.status, "processed")
 
     def test_provider_failure_changes_nothing(self):
         source = FlakySource(DATA)
@@ -148,19 +224,69 @@ class DataHandlingTests(unittest.TestCase):
         self.assertEqual(used["SPY"], DATA["SPY"].bar_on(d))
 
 
+class ConfigAndSettleTests(unittest.TestCase):
+    def test_held_symbol_removed_from_config_is_still_managed(self):
+        # Auditor probe p14: dropping a held symbol from SYMBOLS orphaned its position.
+        eng, store, source = engine()
+        eng.run(evening(date(2019, 1, 2)))
+        eng.run(evening(date(2019, 12, 31)))
+        state = store.load_state()
+        held = sorted(state.positions)
+        self.assertTrue(held, "fixture should hold at least one position")
+        gone = held[0]
+        remaining = ",".join(s for s in SYMS if s != gone)
+        eng2 = LiveSimulationEngine(settings(SYMBOLS=remaining), store, source,
+                                    TrendFollowing.create())
+        eng2.run(evening(date(2020, 6, 30)))
+        self.assertIn("config_changed", [e.kind for e in store.events()])
+        # the orphan kept being marked and managed: either still held with fresh marks,
+        # or closed by its stop/exit rules - never frozen at a stale price
+        state = store.load_state()
+        if gone in state.positions:
+            self.assertEqual(state.last_close[gone], DATA[gone].bar_on(date(2020, 6, 30)).close)
+        else:
+            self.assertTrue(any(t.symbol == gone and t.exit_day > date(2019, 12, 31)
+                                for t in store.trades()))
+        self.assertFalse(any(x.symbol == gone and x.outcome == "order_queued"
+                             and x.action == "enter_long" and x.day > date(2019, 12, 31)
+                             for x in store.decisions()))
+
+    def test_early_close_day_waits_for_corrections_window(self):
+        eng, store, _ = engine()
+        early = date(2019, 11, 29)  # day after Thanksgiving, 1 pm close
+        five_pm_et = session(early).close_utc + timedelta(hours=4)  # 17:00 ET
+        eng.run(five_pm_et)
+        self.assertEqual(store.load_state().last_session, date(2019, 11, 27))
+        eng.run(session(early).close_utc + timedelta(hours=7, minutes=31))  # 20:31 ET
+        self.assertEqual(store.load_state().last_session, early)
+
+
 class ControlsTests(unittest.TestCase):
     def test_pause_flag_reaches_the_core(self):
         eng, store, _ = engine()
         eng.run(evening(date(2018, 1, 2)))
-        eng.pause()
+        eng.pause(evening(date(2018, 1, 2)) + timedelta(minutes=1))
         eng.run(evening(date(2018, 12, 31)))
         queued_entries = [x for x in store.decisions()
                           if x.action == "enter_long" and x.outcome == "order_queued"
                           and x.day > date(2018, 1, 2)]
         self.assertEqual(queued_entries, [])
         self.assertTrue(any("emergency_pause" in x.reason for x in store.decisions()))
-        eng.resume()
+        eng.resume(evening(date(2018, 12, 31)) + timedelta(minutes=1))
         self.assertFalse(store.get_flag("paused"))
+
+    def test_catch_up_applies_pause_as_of_each_session(self):
+        # Pause was switched on mid-way through a stretch the job missed: sessions before
+        # the pause must trade normally, sessions after it must not open positions.
+        eng, store, _ = engine()
+        eng.run(evening(date(2018, 1, 2)))
+        pause_at = evening(date(2018, 6, 29)) + timedelta(minutes=1)
+        store.set_flag("paused", True, pause_at)
+        eng.run(evening(date(2018, 12, 31)))
+        entries = [x for x in store.decisions()
+                   if x.action == "enter_long" and x.outcome == "order_queued"]
+        self.assertTrue(any(x.day <= date(2018, 6, 29) for x in entries))
+        self.assertFalse(any(x.day > date(2018, 6, 29) for x in entries))
 
 
 class ParityTests(unittest.TestCase):

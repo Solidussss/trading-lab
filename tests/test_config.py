@@ -35,7 +35,8 @@ class LoadSettingsTests(unittest.TestCase):
         for name in ("ALPACA_API_KEY", "APCA_API_KEY_ID", "IBKR_ACCOUNT", "IB_GATEWAY_HOST",
                      "QUESTRADE_REFRESH_TOKEN", "WEALTHSIMPLE_PASSWORD", "TRADIER_TOKEN",
                      "SCHWAB_APP_KEY", "BROKER_URL", "MY_BROKER_KEY", "LIVE_TRADING",
-                     "alpaca_secret"):
+                     "alpaca_secret", "INTERACTIVE_BROKERS_USER", "WS_API_TOKEN", "QTRADE_KEY",
+                     "FIDELITY_LOGIN", "MY_BROKERAGE_PASSWORD"):
             with self.subTest(var=name), self.assertRaises(ConfigError):
                 load_settings(valid_env(**{name: "x"}))
 
@@ -62,8 +63,19 @@ class LoadSettingsTests(unittest.TestCase):
                 load_settings(valid_env(DATABASE_URL=bad))
 
     def test_database_url_cannot_point_at_brokerage(self):
-        with self.assertRaises(ConfigError):
-            load_settings(valid_env(DATABASE_URL="postgresql://u:p@db.alpaca.markets/x"))
+        for url in ("postgresql://u:p@db.alpaca.markets/x",
+                    "postgresql://u:p@api.alpaca.markets,db.internal/x",  # multi-host
+                    "postgresql://u:p@db.internal/x?host=api.alpaca.markets",
+                    "postgresql://u:p@db.internal/x?hostaddr=8.8.8.8",
+                    "postgresql://u:p@db.internal/x?service=evil"):
+            with self.subTest(url=url), self.assertRaises(ConfigError):
+                load_settings(valid_env(DATABASE_URL=url))
+
+    def test_libpq_host_overrides_refused(self):
+        for var in ("PGHOST", "PGHOSTADDR", "PGSERVICE", "PGPASSFILE"):
+            with self.subTest(var=var), self.assertRaises(ConfigError):
+                load_settings(valid_env(**{var: "api.alpaca.markets"}))
+        load_settings(valid_env(PGDATABASE="railway"))  # harmless libpq vars are fine
 
     def test_any_proxy_variable_refused(self):
         for var in ("HTTPS_PROXY", "http_proxy", "ALL_PROXY", "WSS_PROXY"):

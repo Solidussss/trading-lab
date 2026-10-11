@@ -54,7 +54,12 @@ class BarSeries:
     issues: list[DataIssue] = field(default_factory=list)
 
     def __post_init__(self) -> None:
-        self.bars, self.issues = _clean(self.symbol, self.bars)
+        inherited = list(self.issues)  # issues found upstream (e.g. rows already rejected)
+        self.bars, found = _clean(self.symbol, self.bars)
+        rejected_days = {i.day for i in inherited if i.kind != "missing_session"}
+        self.issues = inherited + [i for i in found
+                                   if i not in inherited
+                                   and not (i.kind == "missing_session" and i.day in rejected_days)]
         self._index = {b.day: i for i, b in enumerate(self.bars)}
         self._has_splits = any(b.split != 1.0 for b in self.bars)
 

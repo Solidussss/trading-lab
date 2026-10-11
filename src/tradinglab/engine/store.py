@@ -50,7 +50,8 @@ class Store(Protocol):
     def equity_curve(self) -> list[EquityPoint]: ...
     def bars_used(self, session: date) -> dict[str, Bar | None]: ...
     def get_flag(self, name: str, default: bool = False) -> bool: ...
-    def set_flag(self, name: str, value: bool) -> None: ...
+    def set_flag(self, name: str, value: bool, at: datetime | None = None) -> None: ...
+    def flag_at(self, name: str, when: datetime, default: bool = False) -> bool: ...
     def run_lock(self) -> contextlib.AbstractContextManager[None]: ...
 
 
@@ -63,7 +64,7 @@ class InMemoryStore:
         self._curve: list[EquityPoint] = []
         self._bars: dict[date, dict[str, Bar | None]] = {}
         self._events: list[EngineEvent] = []
-        self._flags: dict[str, bool] = {}
+        self._flags: dict[str, list[tuple[datetime, bool]]] = {}  # name -> history
         self._lock = threading.Lock()
         self.fail_next_commit = False  # failure injection for atomicity tests
 
@@ -110,10 +111,21 @@ class InMemoryStore:
         return dict(self._bars.get(session, {}))
 
     def get_flag(self, name, default=False):
-        return self._flags.get(name, default)
+        hist = self._flags.get(name)
+        return hist[-1][1] if hist else default
 
-    def set_flag(self, name, value):
-        self._flags[name] = bool(value)
+    def set_flag(self, name, value, at=None):
+        from datetime import UTC
+
+        self._flags.setdefault(name, []).append((at or datetime.now(UTC), bool(value)))
+
+    def flag_at(self, name, when, default=False):
+        """Value the flag had at `when` (history-aware, for catch-up runs)."""
+        value = default
+        for t, v in self._flags.get(name, []):
+            if t <= when:
+                value = v
+        return value
 
     @contextlib.contextmanager
     def run_lock(self) -> Iterator[None]:

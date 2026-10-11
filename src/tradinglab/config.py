@@ -19,7 +19,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Final
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 from tradinglab.safety.endpoints import DEFAULT_ALLOWED_HOSTS, is_brokerage_host, normalize_host
 
@@ -41,14 +41,17 @@ SYMBOL_RE: Final = re.compile(r"^[A-Z]{1,5}$")
 TIINGO_TOKEN_RE: Final = re.compile(r"^[A-Za-z0-9]{20,64}$")
 ANTHROPIC_KEY_RE: Final = re.compile(r"^sk-ant-[A-Za-z0-9_\-]{20,200}$")
 _DECIMAL_RE: Final = re.compile(r"^-?\d+(\.\d+)?$")
+LIBPQ_HOST_VARS: Final = frozenset({"PGHOST", "PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE",
+                                     "PGPASSFILE", "PGSYSCONFDIR"})
 _TRUE: Final = frozenset({"true", "1", "yes"})
 _FALSE: Final = frozenset({"false", "0", "no"})
 
 # Any variable whose name looks like brokerage configuration aborts startup.
 BROKERAGE_ENV_RE: Final = re.compile(
-    r"^(ALPACA|APCA|IBKR|IB_|TWS_|QUESTRADE|WEALTHSIMPLE|TRADIER|SCHWAB|TDA_|TDAMERITRADE|"
-    r"ETRADE|ROBINHOOD|TASTY|WEBULL|MOOMOO|FUTU|TRADESTATION|OANDA|FXCM|COINBASE|KRAKEN|"
-    r"BINANCE|BROKER)|_BROKER(_|$)|LIVE_TRADING|REAL_MONEY",
+    r"^(ALPACA|APCA|IBKR|IB_|TWS_|INTERACTIVE_?BROKERS|QUESTRADE|QTRADE|WEALTHSIMPLE|WS_API|"
+    r"TRADIER|SCHWAB|TDA_|TDAMERITRADE|ETRADE|ROBINHOOD|TASTY|WEBULL|MOOMOO|FUTU|TRADESTATION|"
+    r"OANDA|FXCM|FIDELITY|COINBASE|KRAKEN|BINANCE|BROKER)|_BROKER(AGE)?(_|$)|LIVE_TRADING|"
+    r"REAL_MONEY",
     re.IGNORECASE,
 )
 
@@ -193,6 +196,12 @@ def _reject_brokerage_and_proxies(env: Mapping[str, str]) -> None:
         n for n in env
         if n.upper().endswith("_PROXY") and n.upper() != "NO_PROXY" and env[n].strip()
     )
+    # libpq reads these and connects in C, outside the egress guard. DATABASE_URL is the
+    # only accepted way to name the database host.
+    libpq = sorted(n for n in env if n.upper() in LIBPQ_HOST_VARS)
+    if libpq:
+        raise ConfigError("Remove " + ", ".join(libpq) + ": the database host must come only "
+                          "from DATABASE_URL, which is validated.")
     if proxies:
         raise ConfigError(
             "Proxy variables " + ", ".join(proxies) + " are not allowed: they would hide "
@@ -204,11 +213,22 @@ def _database_host(url: Secret) -> str:
     parts = urlsplit(url.get())
     if parts.scheme not in ("postgresql", "postgres", "postgresql+psycopg"):
         raise ConfigError("DATABASE_URL must be a postgresql:// URL.")
+    if "," in parts.netloc:
+        raise ConfigError("DATABASE_URL must name exactly one host.")
+    query_keys = {k.lower() for k, _ in parse_qsl(parts.query, keep_blank_values=True)}
+    forbidden = query_keys & {"host", "hostaddr", "service", "servicefile", "passfile"}
+    if forbidden:
+        raise ConfigError("DATABASE_URL may not override the host via query parameters ("
+                          + ", ".join(sorted(forbidden)) + ").")
     if not parts.hostname:
         raise ConfigError("DATABASE_URL has no host.")
-    if is_brokerage_host(parts.hostname):
+    try:
+        host = normalize_host(parts.hostname)
+    except Exception as exc:
+        raise ConfigError("DATABASE_URL host is malformed.") from exc
+    if is_brokerage_host(host):
         raise ConfigError("DATABASE_URL points at a brokerage domain; refused.")
-    return normalize_host(parts.hostname)
+    return host
 
 
 def _required(env: Mapping[str, str], name: str) -> str:

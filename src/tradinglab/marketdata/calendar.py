@@ -172,7 +172,8 @@ def ny_date(ts: datetime) -> date:
     return ts.astimezone(NY).date()
 
 
-def last_completed_session(now_utc: datetime, settle_minutes: int = 20) -> date:
+def last_completed_session(now_utc: datetime, settle_minutes: int = 20,
+                           not_before: time | None = None) -> date:
     """Most recent session whose daily bar is final and queryable on the free SIP rule.
 
     A session counts as complete `settle_minutes` after its close, once the provider has
@@ -183,8 +184,12 @@ def last_completed_session(now_utc: datetime, settle_minutes: int = 20) -> date:
         raise ValueError("now_utc must be timezone-aware.")
     d = now_utc.astimezone(NY).date()
     for _ in range(15):
-        if is_trading_day(d) and now_utc >= session(d).close_utc + timedelta(minutes=settle_minutes):
-            return d
+        if is_trading_day(d):
+            ready = session(d).close_utc + timedelta(minutes=settle_minutes)
+            if not_before is not None:  # e.g. the provider's corrections window ends 8 pm ET
+                ready = max(ready, datetime.combine(d, not_before, tzinfo=NY).astimezone(UTC))
+            if now_utc >= ready:
+                return d
         d -= timedelta(days=1)
     raise RuntimeError("no completed session found in the last 15 days")
 

@@ -1,38 +1,45 @@
 """Live paper simulation: runs the shared simulation core forward, one real session at a time.
 
-A scheduled job calls `LiveSimulationEngine.run(now)` once each evening (after the data
-provider's corrections window). Each run:
+A scheduled job calls `LiveSimulationEngine.run(now)` once each evening. Each run:
 
   1. Takes the run lock (concurrent runs are refused).
-  2. Works out the latest *settled* session (close + SETTLE_MINUTES).
+  2. Works out the latest *settled* session: close + 4.5 h and never before 8:30 pm ET,
+     after the data provider's corrections window.
   3. Loads the persisted portfolio state. The very first run initialises a fresh $10,000
      portfolio whose history starts at that session (no back-dated trades).
-  4. Fetches recent bars once, then processes every session after the last processed one,
-     in order - so missed days (outage, redeploy) are caught up exactly as if the job had
-     run each day.
-  5. If a session's bars are incomplete, it waits (stops, without advancing) unless the
-     session is MAX_DATA_WAIT_SESSIONS old, in which case it proceeds and records the gap.
-  6. Commits state + records atomically per session. A crash mid-run loses nothing: the
-     next run resumes after the last committed session.
-
-Fills use the session's real open/high/low prices, which is why orders decided at
-close(D) are settled when D+1's bar arrives: the evening job after D+1.
+  4. Fetches recent bars once (configured symbols plus any symbol still held), then processes
+     every session after the last processed one, in order - missed days are caught up
+     exactly as if the job had run each day, with the pause setting that applied that day.
+  5. Never invents or discards data:
+       * a symbol's bar missing for session D is accepted as a gap only when the provider
+         has already delivered later sessions for that symbol (evidence it has moved past D);
+         otherwise the run stops and waits;
+       * if every symbol is missing D but all have later bars, the market is treated as
+         closed that day (unscheduled closure) and the session is skipped;
+       * a session whose bar was rejected by validation (bad OHLC etc.), or whose overnight
+         price change is implausible without a recorded split (|ln(open/prev close)| > ln 1.35),
+         blocks processing until the provider corrects it or you acknowledge it.
+  6. Commits state + records atomically per session. A crash mid-run loses nothing.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
+import math
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, date, datetime, time, timedelta
 
 from tradinglab.config import Settings
 from tradinglab.engine.risk import RiskParams
-from tradinglab.engine.store import EngineEvent, Store
+from tradinglab.engine.store import EngineBusyError, EngineEvent, Store
 from tradinglab.marketdata.bars import BarSeries
 from tradinglab.marketdata.calendar import (
     is_trading_day,
     last_completed_session,
     previous_trading_day,
+    session,
     trading_days,
 )
 from tradinglab.marketdata.source import BarSource
@@ -40,18 +47,31 @@ from tradinglab.research.costs import CostModel
 from tradinglab.sim.core import Controls, PortfolioState, SimulationCore
 from tradinglab.strategies.base import Strategy
 
-# Tiingo publishes ~5:30 pm ET and corrects until ~8 pm ET; 4.5 h after a 4 pm close is
-# 8:30 pm ET (5:30 pm ET after a 1 pm early close).
-SETTLE_MINUTES = 270
-MAX_DATA_WAIT_SESSIONS = 2
+SETTLE_MINUTES = 270  # 4.5 h after the close...
+SETTLE_NOT_BEFORE = time(20, 30)  # ...and never before 8:30 pm ET (corrections end ~8 pm)
+MAX_OVERNIGHT_LOG_MOVE = math.log(1.35)
+STALL_ALERT_SESSIONS = 3
+BLOCKING_ISSUES = {"bad_ohlc", "non_positive", "non_finite", "duplicate"}
 
 
 @dataclass
 class RunReport:
-    status: str  # initialized|processed|up_to_date|waiting_for_data|data_error|busy
+    status: str  # initialized|processed|up_to_date|waiting_for_data|blocked|data_error|busy
     target: date | None
     processed: list[date] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
+
+
+def settled_session(now: datetime) -> date:
+    return last_completed_session(now, settle_minutes=SETTLE_MINUTES,
+                                  not_before=SETTLE_NOT_BEFORE)
+
+
+def decision_time(day: date) -> datetime:
+    """When the evening run for `day` would normally have made its decisions."""
+    close = session(day).close_utc
+    nb = datetime.combine(day, SETTLE_NOT_BEFORE, tzinfo=session(day).close_ny.tzinfo)
+    return max(close + timedelta(minutes=SETTLE_MINUTES), nb.astimezone(UTC))
 
 
 class LiveSimulationEngine:
@@ -61,9 +81,14 @@ class LiveSimulationEngine:
         self.store = store
         self.source = source
         self.symbols: Sequence[str] = settings.symbols
-        self.core = SimulationCore(strategy, settings.symbols,
-                                   RiskParams.from_limits(settings.risk), costs or CostModel(),
+        self.risk = RiskParams.from_limits(settings.risk)
+        self.costs = costs or CostModel()
+        self.core = SimulationCore(strategy, settings.symbols, self.risk, self.costs,
                                    drawdown_resume="manual")
+        self.fingerprint = hashlib.sha256(json.dumps(
+            {"symbols": list(settings.symbols), "strategy": strategy.spec.label,
+             "risk": asdict(self.risk), "costs": asdict(self.costs)},
+            sort_keys=True).encode()).hexdigest()[:16]
 
     # ------------------------------------------------------------------------------------
 
@@ -72,78 +97,152 @@ class LiveSimulationEngine:
         try:
             with self.store.run_lock():
                 return self._run_locked(now)
-        except Exception as exc:  # noqa: BLE001 - always leave an audit trail, then re-raise
-            from tradinglab.engine.store import EngineBusyError
-
-            if isinstance(exc, EngineBusyError):
-                return RunReport("busy", None, messages=[str(exc)])
-            self._event(now, None, "run_error", f"{type(exc).__name__}: {exc}")
+        except EngineBusyError as exc:
+            return RunReport("busy", None, messages=[str(exc)])
+        except Exception as exc:
+            try:  # leave an audit trail, but never mask the original error
+                self._event(now, None, "run_error", f"{type(exc).__name__}: {exc}")
+            except Exception:  # noqa: BLE001, S110
+                pass
             raise
 
     def _run_locked(self, now: datetime) -> RunReport:
-        target = last_completed_session(now, settle_minutes=SETTLE_MINUTES)
+        target = settled_session(now)
         state = self.store.load_state()
         report = RunReport("up_to_date", target)
         if state is None:
             state = PortfolioState.initial(float(self.settings.capital_base_usd))
             state.last_session = previous_trading_day(target)
+            state.config_fingerprint = self.fingerprint
             self.store.save_state(state)
             self._event(now, target, "initialized",
                         f"new ${state.initial_capital:,.0f} simulated portfolio; first session "
-                        f"{target}")
+                        f"{target}; config {self.fingerprint}")
             report.status = "initialized"
         assert state.last_session is not None
+        if state.config_fingerprint != self.fingerprint:
+            self._event(now, None, "config_changed",
+                        f"configuration {state.config_fingerprint or '?'} -> {self.fingerprint} "
+                        "(symbols/strategy/risk/costs); held positions remain managed")
+            state.config_fingerprint = self.fingerprint
+            self.store.save_state(state)
         if state.last_session >= target:
             return report
 
+        wanted = list(self.symbols) + sorted(s for s in state.positions if s not in self.symbols)
         sessions = trading_days(state.last_session + timedelta(days=1), target)
         try:
-            data = self.source.history(self.symbols, through=target)
+            data = self.source.history(wanted, through=target)
         except Exception as exc:  # provider down / bad token: nothing advances
             self._event(now, target, "data_error", f"{type(exc).__name__}: {exc}")
             report.status = "data_error"
             report.messages.append(str(exc))
             return report
-        self._check_calendar(now, data, state.last_session, target)
-        for sym in self.symbols:  # seed marks for symbols without a close yet
+        self._flag_calendar_anomalies(now, data, state.last_session, target)
+        for sym in wanted:
             if sym not in state.last_close:
                 hist = data[sym].history_through(state.last_session)
                 if hist:
                     state.last_close[sym] = hist[-1].close
 
         for day in sessions:
-            bars = {s: data[s].bar_on(day) for s in self.symbols}
-            missing = sorted(s for s, b in bars.items() if b is None)
-            if missing:
-                age = len(trading_days(day, target)) - 1
-                if age < MAX_DATA_WAIT_SESSIONS:
-                    self._event(now, day, "waiting_for_data",
-                                f"no bar yet for {', '.join(missing)}; will retry next run")
-                    report.status = "waiting_for_data"
-                    break
-                self._event(now, day, "data_gap_accepted",
-                            f"{', '.join(missing)} still missing after {age} sessions; "
-                            "processing with gap (pending orders for them are cancelled)")
+            verdict, detail = self._assess(day, wanted, data)
+            if verdict in ("wait", "block"):
+                kind = "waiting_for_data" if verdict == "wait" else "data_blocked"
+                behind = len(trading_days(day, target))
+                if behind >= STALL_ALERT_SESSIONS:
+                    detail += f" (stalled {behind} sessions - check the data provider)"
+                self._event(now, day, kind, detail)
+                report.status = "waiting_for_data" if verdict == "wait" else "blocked"
+                report.messages.append(detail)
+                break
+            if verdict == "closed":
+                result = SimulationCore.skip_session(state, day, detail)
+                self.store.commit_session(state, result, {})
+                self._event(now, day, "session_skipped", detail)
+                report.processed.append(day)
+                report.status = "processed"
+                continue
+            if detail:  # accepted single-symbol gaps
+                self._event(now, day, "data_gap_accepted", detail)
+
+            bars = {s: data[s].bar_on(day) for s in wanted}
 
             def history(sym: str, d: date, _data: dict[str, BarSeries] = data):
                 return _data[sym].history_through(d)
 
-            result = self.core.step(state, day, bars, history,
-                                    Controls(paused=self.store.get_flag("paused")))
+            paused = self.store.flag_at("paused", decision_time(day))
+            result = self.core.step(state, day, bars, history, Controls(paused=paused))
             self.store.commit_session(state, result, bars)
             report.processed.append(day)
             report.status = "processed"
         return report
 
+    # -- data integrity -------------------------------------------------------------------
+
+    def _assess(self, day: date, symbols: Sequence[str], data: dict[str, BarSeries]
+                ) -> tuple[str, str]:
+        """'ok' | 'gap' (proceed with some symbols missing) | 'closed' | 'wait' | 'block'."""
+        missing, gaps = [], []
+        for sym in symbols:
+            series = data[sym]
+            bad = [i for i in series.issues if i.day == day and i.kind in BLOCKING_ISSUES]
+            if bad and not self._acknowledged(sym, day):
+                return "block", (f"{sym} {day}: provider row rejected ({bad[0].kind}); waiting "
+                                 "for a correction or your acknowledgement")
+            bar = series.bar_on(day)
+            if bar is None:
+                missing.append(sym)
+                continue
+            prev = series.history_through(day - timedelta(days=1))
+            if prev:
+                ratio = bar.open * bar.split / prev[-1].close  # split-normalised overnight move
+                if abs(math.log(ratio)) > MAX_OVERNIGHT_LOG_MOVE and not self._acknowledged(sym, day):
+                    return "block", (f"{sym} {day}: overnight move {ratio - 1:+.0%} without a "
+                                     "matching recorded split; possible missing corporate action")
+        if not missing:
+            return "ok", ""
+        later = {s: any(b.day > day for b in data[s].bars) for s in missing}
+        if len(missing) == len(symbols):
+            if all(later.values()):
+                return "closed", (f"no bars for any symbol on {day} although later sessions "
+                                  "exist: treated as an unscheduled market closure")
+            return "wait", f"no bars yet for {day}; will retry next run"
+        for s in missing:
+            if not later[s]:
+                return "wait", f"{s} has no bar yet for {day}; will retry next run"
+            gaps.append(s)
+        return "gap", (f"{', '.join(gaps)} missing on {day} while later sessions exist; "
+                       "processed with a gap (pending orders for them cancelled)")
+
+    def _acknowledged(self, sym: str, day: date) -> bool:
+        return self.store.get_flag(f"ack:{sym}:{day.isoformat()}")
+
+    def acknowledge_anomaly(self, sym: str, day: date, now: datetime | None = None) -> None:
+        """You reviewed a blocked session's data and want it processed as delivered."""
+        self.store.set_flag(f"ack:{sym}:{day.isoformat()}", True, now)
+        self._event(now or datetime.now(UTC), day, "anomaly_acknowledged", sym)
+
+    def _flag_calendar_anomalies(self, now: datetime, data: dict[str, BarSeries], after: date,
+                                 through: date) -> None:
+        for sym, series in data.items():
+            for b in series.bars:
+                if after < b.day <= through and not is_trading_day(b.day):
+                    self._event(now, b.day, "calendar_anomaly",
+                                f"{sym} has a bar on {b.day}, which the NYSE calendar marks "
+                                "closed; bar ignored")
+
     # -- controls (dashboard) -------------------------------------------------------------
 
     def pause(self, now: datetime | None = None) -> None:
-        self.store.set_flag("paused", True)
-        self._event(now or datetime.now(UTC), None, "paused", "emergency pause ON: no new entries")
+        now = now or datetime.now(UTC)
+        self.store.set_flag("paused", True, now)
+        self._event(now, None, "paused", "emergency pause ON: no new entries")
 
     def resume(self, now: datetime | None = None) -> None:
-        self.store.set_flag("paused", False)
-        self._event(now or datetime.now(UTC), None, "resumed", "emergency pause OFF")
+        now = now or datetime.now(UTC)
+        self.store.set_flag("paused", False, now)
+        self._event(now, None, "resumed", "emergency pause OFF")
 
     def resume_after_drawdown(self, now: datetime | None = None) -> None:
         with self.store.run_lock():
@@ -155,16 +254,5 @@ class LiveSimulationEngine:
             self._event(now or datetime.now(UTC), state.last_session, "drawdown_resumed",
                         f"new peak baseline ${state.peak_equity:,.2f}")
 
-    # ------------------------------------------------------------------------------------
-
-    def _check_calendar(self, now: datetime, data: dict[str, BarSeries], after: date,
-                        through: date) -> None:
-        for sym, series in data.items():
-            for b in series.bars:
-                if after < b.day <= through and not is_trading_day(b.day):
-                    self._event(now, b.day, "calendar_anomaly",
-                                f"{sym} has a bar on {b.day}, which the NYSE calendar marks "
-                                "closed; bar ignored")
-
-    def _event(self, now: datetime, session: date | None, kind: str, detail: str) -> None:
-        self.store.add_event(EngineEvent(now, session, kind, detail))
+    def _event(self, now: datetime, day: date | None, kind: str, detail: str) -> None:
+        self.store.add_event(EngineEvent(now, day, kind, detail))

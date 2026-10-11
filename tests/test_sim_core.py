@@ -88,6 +88,28 @@ class CorporateActionTests(unittest.TestCase):
         self.assertEqual(data["SPY"].history_through(DAYS[3])[-1].close, 100)
 
 
+class CashInLieuTests(unittest.TestCase):
+    def test_fractional_split_cash_in_lieu_is_in_trade_pnl(self):
+        # 3:2 split on 7 shares -> 10 shares + 0.5 share paid in cash. Equity change must
+        # equal the sum of trade P&L (auditor probe p12 found a gap).
+        d0, d3, d6 = DAYS[0], DAYS[3], DAYS[6]
+        over = {d: (66.67, 67.0, 66.0, 66.67, 0.0, 1.5 if d == d3 else 1.0)
+                for d in DAYS if d >= d3}
+        data = {"SPY": series(over)}
+        strat = Scripted({d0: Signal(Action.ENTER_LONG, "go", stop_price=93.0),
+                          d6: Signal(Action.EXIT, "done")})
+        _, state, results = run(strat, data, days=DAYS[:9])
+        trades = [t for r in results for t in r.trades]
+        self.assertEqual(len(trades), 1)
+        self.assertAlmostEqual(state.cash - 10_000, sum(t.pnl for t in trades), places=6)
+        self.assertAlmostEqual(state.realized_pnl, sum(t.pnl for t in trades), places=6)
+
+    def test_unknown_state_keys_are_ignored(self):
+        st = PortfolioState.initial(10_000.0).to_dict()
+        st["field_from_a_future_version"] = 1
+        self.assertEqual(PortfolioState.from_dict(st).cash, 10_000.0)
+
+
 class StateAndControlsTests(unittest.TestCase):
     def test_state_json_round_trip_mid_trade(self):
         strat = Scripted({DAYS[0]: Signal(Action.ENTER_LONG, "go", stop_price=95.0),

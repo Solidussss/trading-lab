@@ -65,13 +65,12 @@ def load_dotenv_if_present(path: Path = Path(".env")) -> None:
 
 def cmd_fetch(args: argparse.Namespace) -> int:
     load_dotenv_if_present()
-    from tradinglab.config import load_settings
     from tradinglab.marketdata.calendar import last_completed_session
     from tradinglab.marketdata.tiingo import TiingoClient
-    from tradinglab.safety.network_guard import install_network_guard
 
-    settings = load_settings(os.environ)
-    install_network_guard(settings.egress_hosts)
+    from tradinglab.safety.selfcheck import run_selfcheck
+
+    settings = run_selfcheck(os.environ).settings  # guard installed, allowlist frozen
     client = TiingoClient(settings.require_data_token())
     latest = last_completed_session(datetime.now(UTC), settle_minutes=270)
     end = min(date.fromisoformat(args.end), latest) if args.end else latest

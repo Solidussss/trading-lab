@@ -63,18 +63,32 @@ class RateLimiter:
                 self._sleep(self.per - (now - self._calls[0]) + 0.01)
 
 
-HttpGet = Callable[[str, dict[str, str], float], tuple[int, bytes]]
+MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # ~500 days x 3 symbols is well under 1 MB
+MAX_RETRY_AFTER_SECONDS = 120  # a longer server-requested wait ends the run (retry tomorrow)
+
+# (status, body, headers); test doubles may return just (status, body).
+HttpGet = Callable[[str, dict[str, str], float], tuple]
 
 
-def _urllib_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, bytes]:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: urllib would forward the Authorization header (our token)
+    to whatever host or scheme the redirect names."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+def _urllib_get(url: str, headers: dict[str, str], timeout: float) -> tuple[int, bytes, dict]:
     # ProxyHandler({}) ignores proxy env/OS settings: the egress guard must see the real host.
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
     req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310
     try:
         with opener.open(req, timeout=timeout) as resp:
-            return resp.status, resp.read()
+            body = resp.read(MAX_RESPONSE_BYTES + 1)
+            return resp.status, body, dict(resp.headers)
     except urllib.error.HTTPError as exc:
-        return exc.code, exc.read() if exc.fp else b""
+        body = exc.read(MAX_RESPONSE_BYTES + 1) if exc.fp else b""
+        return exc.code, body, dict(exc.headers or {})
 
 
 class TiingoClient:
@@ -124,10 +138,17 @@ class TiingoClient:
         last_error = ""
         for attempt in range(1, self.max_attempts + 1):
             self.limiter.acquire()
+            resp_headers: dict = {}
             try:
-                status, body = self._http_get(url, headers, self.timeout)
+                result = self._http_get(url, headers, self.timeout)
+                status, body = result[0], result[1]
+                resp_headers = result[2] if len(result) > 2 else {}
             except (TimeoutError, OSError) as exc:  # network trouble: retry
                 status, body, last_error = 0, b"", type(exc).__name__
+            if len(body) > MAX_RESPONSE_BYTES:
+                raise DataProviderError("provider response exceeded the size limit")
+            if 300 <= status < 400:
+                raise DataProviderError(f"provider redirected (HTTP {status}); refusing to follow")
             if status == 200:
                 try:
                     return json.loads(body)
@@ -140,11 +161,27 @@ class TiingoClient:
             if status and status not in (429, 500, 502, 503, 504):
                 raise DataProviderError(f"provider error HTTP {status}")
             last_error = last_error or f"HTTP {status}"
+            wait = delay
+            if status == 429:
+                retry_after = _retry_after_seconds(resp_headers)
+                if retry_after is not None and retry_after > MAX_RETRY_AFTER_SECONDS:
+                    raise DataProviderError(f"rate limited; provider asked to wait {retry_after:.0f}s")
+                wait = max(wait, retry_after or 0.0)
             if attempt < self.max_attempts:
-                self._sleep(delay)
+                self._sleep(wait)
                 delay *= 2
         raise DataProviderError(f"provider unreachable after {self.max_attempts} attempts "
                                 f"({last_error})")
+
+
+def _retry_after_seconds(headers: dict) -> float | None:
+    for k, v in headers.items():
+        if str(k).lower() == "retry-after":
+            try:
+                return max(float(v), 0.0)
+            except (TypeError, ValueError):
+                return None
+    return None
 
 
 def parse_row(r: dict[str, Any]) -> Bar:

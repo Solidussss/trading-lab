@@ -25,5 +25,10 @@ class InMemoryBarSource:
         out = {}
         for s in symbols:
             series = self._data.get(s)
-            out[s] = BarSeries(s, [b for b in series.bars if b.day <= through] if series else [])
+            if series is None:
+                out[s] = BarSeries(s, [])
+                continue
+            out[s] = BarSeries(s, [b for b in series.bars if b.day <= through],
+                               [i for i in series.issues
+                                if i.kind != "missing_session" and (i.day is None or i.day <= through)])
         return out
