@@ -1,10 +1,10 @@
-"""Production wiring: build the live engine, and run it on a schedule inside the web service.
+"""Production wiring: build the engines, and run them on a schedule inside the web service.
 
-Scheduling choice: the engine is idempotent and cheap when nothing is pending (it returns
-"up_to_date" without any network call), so the web service simply checks every
-CHECK_INTERVAL. A session is processed on the first check after it settles (8:30 pm ET or
-later); a restart or outage is caught up on the next check. `python main.py nightly` runs
-one check and exits, for anyone who prefers a separate Railway cron service.
+Each check runs, in order: the daily trend account, the day-trading bots, then (with whatever
+request budget is left) the intraday history loader and the history tests. Every step is
+idempotent and cheap when there is nothing to do. Checks run every 5 minutes while the market
+is open and every 15 minutes otherwise. `python main.py nightly` runs one daily-account check
+and exits, for anyone who prefers a separate Railway cron service.
 """
 
 from __future__ import annotations
@@ -15,17 +15,22 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 
 from tradinglab.config import ConfigError, Settings
 from tradinglab.engine.live import LiveSimulationEngine, RunReport
 from tradinglab.engine.pg_store import PostgresStore
-from tradinglab.marketdata.tiingo import TiingoBarSource, TiingoClient
+from tradinglab.intraday.live import DEFAULT_BOTS, IntradayRunner, settled
+from tradinglab.intraday.research import backfill_status, backfill_step, run_history_test
+from tradinglab.marketdata.calendar import is_trading_day, ny_date, previous_trading_day, session
+from tradinglab.marketdata.tiingo import SHARED_LIMITER, TiingoBarSource, TiingoClient
 from tradinglab.strategies.trend_following import TrendFollowing
 
 log = logging.getLogger(__name__)
 
 CHECK_INTERVAL_S = 15 * 60
+MARKET_INTERVAL_S = 5 * 60
+BACKFILL_HEADROOM = 12  # requests per hour always left free for the live bots
 RETRY_AFTER_ERROR_S = 5 * 60
 
 
@@ -46,6 +51,46 @@ def build_engine(settings: Settings, store: PostgresStore | None = None) -> Live
     return LiveSimulationEngine(settings, store, source, TrendFollowing.create())
 
 
+def build_intraday(settings: Settings, store: PostgresStore) -> IntradayRunner:
+    client = TiingoClient(settings.require_data_token())
+    return IntradayRunner(settings, store, client.iex_rows, DEFAULT_BOTS)
+
+
+def market_busy(now: datetime) -> bool:
+    """From 15 minutes before the open until the session has settled."""
+    d = ny_date(now)
+    if not is_trading_day(d):
+        return False
+    s = session(d)
+    return s.open_utc - timedelta(minutes=15) <= now and not settled(d, now)
+
+
+class ResearchJob:
+    """Loads intraday history in the background and re-runs the history tests when it grows."""
+
+    def __init__(self, runner: IntradayRunner, client: TiingoClient) -> None:
+        self.runner, self.client = runner, client
+        self.last_loaded = -1
+        self.last_test_day: date | None = None
+
+    def check(self, now: datetime) -> str:
+        r = self.runner
+        end = previous_trading_day(ny_date(now))
+        if not market_busy(now):
+            budget = max(0, SHARED_LIMITER.max_calls - BACKFILL_HEADROOM - SHARED_LIMITER.used())
+            if budget:
+                backfill_step(r.store, self.client.iex_rows, r.symbols, end, min(budget, 20), now,
+                              fetch_daily=lambda sym, a, b: self.client.daily(sym, a, b).bars)
+        status = backfill_status(r.store, r.symbols, end)
+        grew = status.days_loaded >= self.last_loaded + max(60, status.days_total // 20)
+        new_day = self.last_test_day != end
+        if not market_busy(now) and (grew or (new_day and status.done)):
+            run_history_test(r.store, r.bots, r.symbols, r.risk, r.capital, end=end, now=now,
+                             unlocked=lambda bot_id: r.store.get_flag(f"unlock_test:{bot_id}"))
+            self.last_loaded, self.last_test_day = status.days_loaded, end
+        return f"history {status.fraction:.0%} loaded"
+
+
 @dataclass
 class SchedulerStatus:
     started_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -60,9 +105,14 @@ class Scheduler(threading.Thread):
 
     def __init__(self, engine_factory: Callable[[], LiveSimulationEngine], *,
                  interval: float = CHECK_INTERVAL_S,
-                 clock: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+                 extra_jobs: Callable[[], list[tuple[str, Callable[[datetime], object]]]]
+                 | None = None) -> None:
         super().__init__(name="engine-scheduler", daemon=True)
         self._factory = engine_factory
+        self._extra_factory = extra_jobs
+        self._extra: list[tuple[str, Callable[[datetime], object]]] | None = None
+        self.job_status: dict[str, str] = {}
         self._engine: LiveSimulationEngine | None = None
         self._interval = interval
         self._clock = clock
@@ -81,6 +131,7 @@ class Scheduler(threading.Thread):
             if report.processed or report.status not in ("up_to_date",):
                 log.info("engine: %s target=%s processed=%s %s", report.status, report.target,
                          [d.isoformat() for d in report.processed], "; ".join(report.messages))
+            self._run_extra(now)
             return report
         except Exception as exc:  # noqa: BLE001 - keep the scheduler alive; surface the error
             self.status.last_error = f"{type(exc).__name__}: {exc}"
@@ -88,11 +139,29 @@ class Scheduler(threading.Thread):
             log.exception("engine check failed")
             return None
 
+    def _run_extra(self, now: datetime) -> None:
+        """Further jobs (day-trading bots, research). One failing never stops the others."""
+        if self._extra_factory is None:
+            return
+        if self._extra is None:
+            self._extra = self._extra_factory()
+        for name, job in self._extra:
+            try:
+                result = job(now)
+                text = str(getattr(result, "status", result))
+                if text != self.job_status.get(name):
+                    log.info("%s: %s", name, text)
+                self.job_status[name] = text
+            except Exception as exc:  # noqa: BLE001
+                self.job_status[name] = f"error: {type(exc).__name__}: {exc}"
+                log.exception("%s failed", name)
+                self._extra = None  # rebuild next time (e.g. reconnect)
+
     def run(self) -> None:
         while not self._stop.is_set():
             report = self.check_once()
-            wait = self._interval if report is not None else min(self._interval,
-                                                                 RETRY_AFTER_ERROR_S)
+            interval = MARKET_INTERVAL_S if market_busy(self._clock()) else self._interval
+            wait = interval if report is not None else min(interval, RETRY_AFTER_ERROR_S)
             self._stop.wait(wait)
 
     def stop(self) -> None:

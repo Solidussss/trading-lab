@@ -11,7 +11,7 @@ class LoadSettingsTests(unittest.TestCase):
     def test_valid_defaults(self):
         s = load_settings(valid_env())
         self.assertEqual(s.trading_mode, "simulated")
-        self.assertEqual(s.capital_base_usd, Decimal("10000"))
+        self.assertEqual(s.capital_base_usd, Decimal("1000000"))
         self.assertEqual(s.symbols, ("SPY", "QQQ", "IWM"))
         self.assertEqual(s.risk.risk_per_trade_pct, Decimal("0.005"))
         self.assertEqual(s.risk.max_exposure_pct, Decimal("0.30"))

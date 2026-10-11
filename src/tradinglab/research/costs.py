@@ -32,6 +32,7 @@ class CostModel:
     sec_fee_rate: float = 0.0000278
     finra_taf_per_share: float = 0.000166
     finra_taf_max: float = 8.30
+    commission_min: float = 0.0  # per order, e.g. Interactive Brokers fixed: $1.00
 
     def buy_price(self, ref: float) -> float:
         return ref * (1 + (self.half_spread_bps + self.slippage_bps) / 1e4)
@@ -42,6 +43,8 @@ class CostModel:
 
     def fees(self, *, sell: bool, shares: int, price: float) -> float:
         f = self.commission_per_share * shares + self.commission_per_order
+        if f > 0:
+            f = max(f, self.commission_min)
         if sell:
             f += self.sec_fee_rate * shares * price
             f += min(self.finra_taf_per_share * shares, self.finra_taf_max)

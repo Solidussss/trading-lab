@@ -212,6 +212,73 @@ class DashboardTests(unittest.TestCase):
         self.assertIn("DATABASE_URL", state.engine_note)
 
 
+class BotDashboardTests(unittest.TestCase):
+    """Leaderboard and per-bot pages with simulated day-trading bots."""
+
+    @classmethod
+    def setUpClass(cls):
+        from datetime import UTC, date, datetime
+
+        from tests.test_intraday import FakeFeed, at, runner_with
+        from tradinglab.marketdata.calendar import trading_days
+
+        cls.feed = FakeFeed()
+        cls.runner, cls.store = runner_with(cls.feed)
+        cls.runner.run(datetime(2024, 3, 2, 18, tzinfo=UTC))
+        for d in trading_days(date(2024, 3, 4), date(2024, 3, 15)):
+            cls.runner.run(at(d, "16:30"))
+
+    def start(self):
+        base = valid_env(DASHBOARD_PASSWORD=PASSWORD, TIINGO_API_TOKEN=FAKE_TIINGO_TOKEN)
+        state = AppState(base, freeze=False, system_proxies=dict, store=self.store,
+                         controls=object())
+        state.intraday = self.runner
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        return httpd.server_address[1], state
+
+    def test_leaderboard_lists_every_bot_with_plain_numbers(self):
+        port, _ = self.start()
+        status, body, _ = WebTests.get(self, port, password=PASSWORD)
+        self.assertEqual(status, 200)
+        for name in ("Opening breakout", "Gap-down bounce", "Dip below the day", "Ride the day",
+                     "The bots", "How they did on past prices", "Pause new buys"):
+            self.assertIn(name, body)
+        for b in ("orb", "gap", "vwap_dip", "vwap_trend"):
+            self.assertIn(f"href='/bot/{b}'", body)
+        self.assertIn("1,000,000", body)
+
+    def test_bot_page_explains_each_trade(self):
+        port, _ = self.start()
+        for bot in ("orb", "gap", "vwap_dip", "vwap_trend"):
+            status, body, _ = WebTests.get(self, port, f"/bot/{bot}", password=PASSWORD)
+            self.assertEqual(status, 200)
+            self.assertIn("All bots", body)
+            self.assertIn("How this bot trades", body)
+            last = self.store.bot_days(bot)[-1].day
+            for t in self.store.bot_trades(bot, last):
+                self.assertIn(f"Sold {t.shares} {t.symbol}", body)
+            self.assertIn("Day by day", body)
+            for jargon in ("breakout_above", "end_of_day", "stop_hit", "sized_by"):
+                self.assertNotIn(jargon, body)
+        self.assertEqual(WebTests.get(self, port, "/bot/nope", password=PASSWORD)[0], 404)
+        self.assertEqual(WebTests.get(self, port, "/bot/orb")[0], 401)
+
+    def test_open_final_exam_and_resume_bot_actions(self):
+        port, state = self.start()
+        post = DashboardTests.post
+        self.assertEqual(post(self, port, f"action=unlock_test:orb&csrf={state.csrf}"), 303)
+        self.assertTrue(self.store.get_flag("unlock_test:orb"))
+        self.assertEqual(post(self, port, f"action=unlock_test:../x&csrf={state.csrf}"), 400)
+        st = self.store.load_bot("gap")
+        st.halt_latched = True
+        self.store.save_bot("gap", st)
+        self.assertEqual(post(self, port, f"action=resume_bot:gap&csrf={state.csrf}"), 303)
+        self.assertFalse(self.store.load_bot("gap").halt_latched)
+
+
 class SchedulerTests(unittest.TestCase):
     def test_check_once_records_report_and_recovers_from_errors(self):
         from datetime import UTC, datetime

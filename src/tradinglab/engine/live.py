@@ -5,7 +5,7 @@ A scheduled job calls `LiveSimulationEngine.run(now)` once each evening. Each ru
   1. Takes the run lock (concurrent runs are refused).
   2. Works out the latest *settled* session: close + 4.5 h and never before 8:30 pm ET,
      after the data provider's corrections window.
-  3. Loads the persisted portfolio state. The very first run initialises a fresh $10,000
+  3. Loads the persisted portfolio state. The very first run initialises a fresh $1,000,000
      portfolio whose history starts at that session (no back-dated trades).
   4. Fetches recent bars once (configured symbols plus any symbol still held), then processes
      every session after the last processed one, in order - missed days are caught up
@@ -110,8 +110,16 @@ class LiveSimulationEngine:
         target = settled_session(now)
         state = self.store.load_state()
         report = RunReport("up_to_date", target)
+        capital = float(self.settings.capital_base_usd)
+        if (state is not None and state.initial_capital != capital and not self.store.fills()
+                and not self.store.trades() and not state.positions):
+            # unfilled orders are simply re-decided at the new size when the day is re-run
+            self.store.reset_daily_account()  # never traded: start over with the new capital
+            self._event(now, None, "restarted",
+                        f"account had never traded; restarted with ${capital:,.0f}")
+            state = None
         if state is None:
-            state = PortfolioState.initial(float(self.settings.capital_base_usd))
+            state = PortfolioState.initial(capital)
             state.last_session = previous_trading_day(target)
             state.config_fingerprint = self.fingerprint
             self.store.save_state(state)

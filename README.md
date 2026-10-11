@@ -1,8 +1,10 @@
 # Trading Lab
 
-Private, autonomous, **simulation-only** quantitative trading research system for SPY, QQQ
-and IWM. It runs its own virtual portfolio against daily market data from Tiingo. There is
-no brokerage connection and no real-money trading code; see `docs/SAFETY.md`.
+Private, autonomous, **simulation-only** trading research system for SPY, QQQ and IWM. It
+runs several pretend-money bots side by side, each with its own $1,000,000 simulated account:
+four day-trading bots on 5-minute prices (flat every night) and one slow daily trend follower.
+Prices come from Tiingo. There is no brokerage connection and no real-money trading code; see
+`docs/SAFETY.md`.
 
 ## Status
 
@@ -13,8 +15,9 @@ no brokerage connection and no real-money trading code; see `docs/SAFETY.md`.
 | 3 | Simulation core shared by backtests and live engine; live engine with catch-up, idempotency, evidence-based data gaps, atomic commits, pause, manual drawdown resume; Tiingo client | ✅ done, tested (incl. exact live/backtest parity); independently audited |
 | 4 | PostgreSQL store + migrations, advisory-lock run lock | ✅ done, tested against real PostgreSQL |
 | 5 | Railway service: in-app scheduler (15-min idempotent checks), nightly CLI, restart/catch-up | ✅ done |
-| 6 | Authenticated mobile dashboard | 🟡 Overview + controls live; Activity, Strategies, Analytics, Research pages next |
-| 7 | Momentum and mean-reversion strategies | |
+| 6 | Authenticated mobile dashboard | ✅ leaderboard, one page per bot (every trade explained), history-test results, controls |
+| 7 | More strategies | ✅ four day-trading bots (opening breakout, gap-down bounce, VWAP dip, VWAP trend) on a shared intraday core; independently reviewed |
+| 7b | Intraday history tests | ✅ background loader (Aug 2017 on) + fixed train/validation windows, sealed final test |
 | 8 | Claude research reports (scheduled / on demand only) | |
 
 ## Architecture
@@ -35,7 +38,14 @@ Tiingo EOD API ──► marketdata/tiingo.py ──► BarSource
                  dashboard / Claude research (Phases 6, 8)
 ```
 
-- **Virtual portfolio:** `$10,000` starting capital, long-only, no leverage, whole shares.
+- **Virtual portfolios:** `$1,000,000` per bot (`CAPITAL_BASE_USD`), long-only, no leverage,
+  whole shares. Same limits for every bot: 0.5% risk per trade, 30% invested at most, 3
+  positions, -3% daily and -10% peak halts.
+- **Day-trading bots** (`intraday/`): one shared 5-minute IEX feed; each 5-minute step is
+  processed for all funds together; orders fill at the next bar's open with costs and
+  commission; everything sold at the close. The same core runs live, in the dashboard's
+  "today so far" view and in history tests. Add a strategy by subclassing
+  `IntradayStrategy` and registering it in `intraday/strategies.py`.
 - **Execution model:** signal after close(D); on-open limit order at close × 1.01; resting
   protective stop. Fills use D+1's real open/low with conservative costs.
 - **Modular:** `broker/base.py` documents the interface a brokerage adapter would need, but
@@ -56,8 +66,10 @@ Tiingo EOD API ──► marketdata/tiingo.py ──► BarSource
 3. Service → Settings → Networking → Generate Domain. Open it on your phone.
 
 Once the database is attached, the web service checks every 15 minutes and processes each
-trading day after it settles (8:30 pm ET or later). The first run starts a fresh $10,000
-portfolio at the latest settled session. `python main.py nightly` runs one check and exits,
+trading day after it settles (8:30 pm ET or later); during market hours it checks every 5
+minutes for the day-trading bots and commits each bot's day 20 minutes after the close. Each
+new bot starts on the next session with $1,000,000. In the background, the remaining Tiingo
+request budget loads intraday history back to August 2017 and re-runs the history tests. `python main.py nightly` runs one check and exits,
 if you prefer a separate Railway cron service.
 
 Do not add brokerage or proxy variables: the app refuses to start its trading functions
@@ -90,6 +102,8 @@ src/tradinglab/
   sim/core.py         the simulation core (one session at a time, serialisable state)
   engine/live.py      live paper simulation driver; engine/store.py persistence interface
   research/           backtester, costs, metrics, splits/walk-forward/test vault, CLI
+  intraday/           day-trading core, strategies, live runner, history tests
+  web/                dashboard (views_bots.py: leaderboard and bot pages)
   broker/base.py      future brokerage interface (documentation only)
 tests/                unittest-style; run with pytest or `python -m unittest`
 docs/                 SAFETY.md, DATA.md, RESEARCH.md

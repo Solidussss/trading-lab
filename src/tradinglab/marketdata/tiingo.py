@@ -10,7 +10,8 @@ Provider facts this module is built around (checked 2026-10-10, see docs/DATA.md
   * Auth via `Authorization: Token <token>` header (never in the URL, so it cannot leak
     into logs or error messages).
 
-The engine fetches one request per symbol per day (3 requests for SPY/QQQ/IWM).
+The daily engine fetches one request per symbol per day (3 requests for SPY/QQQ/IWM); the
+intraday bots share one 5-minute feed (3 requests per poll) - see marketdata/intraday.py.
 """
 
 from __future__ import annotations
@@ -51,6 +52,14 @@ class RateLimiter:
         self._clock, self._sleep = clock, sleep
         self._lock = threading.Lock()
 
+    def used(self) -> int:
+        """Calls made in the current window (lets low-priority work leave headroom)."""
+        with self._lock:
+            now = self._clock()
+            while self._calls and now - self._calls[0] >= self.per:
+                self._calls.popleft()
+            return len(self._calls)
+
     def acquire(self) -> None:
         with self._lock:
             while True:
@@ -61,6 +70,24 @@ class RateLimiter:
                     self._calls.append(now)
                     return
                 self._sleep(self.per - (now - self._calls[0]) + 0.01)
+
+
+# One limiter for the whole process: the daily engine, the intraday bots and the history
+# backfill all share the free plan's 50 requests/hour (kept at 45 for headroom).
+SHARED_LIMITER = RateLimiter(max_calls=45, per_seconds=3600.0)
+DAILY_LIMITER = RateLimiter(max_calls=900, per_seconds=86400.0)  # plan: 1,000/day
+
+
+class _Both:
+    def __init__(self, *limiters: RateLimiter) -> None:
+        self.limiters = limiters
+
+    def used(self) -> int:
+        return self.limiters[0].used()
+
+    def acquire(self) -> None:
+        for lim in self.limiters:
+            lim.acquire()
 
 
 MAX_RESPONSE_BYTES = 10 * 1024 * 1024  # ~500 days x 3 symbols is well under 1 MB
@@ -98,8 +125,7 @@ class TiingoClient:
         install_network_guard()
         self._token = token
         self._http_get = http_get
-        # Free plan: 50/hour. Stay at 40/hour for headroom (daily job uses 3).
-        self.limiter = limiter or RateLimiter(max_calls=40, per_seconds=3600.0)
+        self.limiter = limiter or _Both(SHARED_LIMITER, DAILY_LIMITER)
         self.timeout, self.max_attempts, self._sleep = timeout, max_attempts, sleep
 
     def daily(self, symbol: str, start: date, end: date) -> BarSeries:
@@ -114,6 +140,17 @@ class TiingoClient:
         if not isinstance(rows, list):
             raise DataProviderError(f"{symbol}: expected a list of rows")
         return BarSeries(symbol, [parse_row(r) for r in rows])
+
+    def iex_rows(self, symbol: str, start: date, end: date) -> list[dict[str, Any]]:
+        """Raw 5-minute IEX rows for [start, end] (see marketdata/intraday.py)."""
+        query = urllib.parse.urlencode({"startDate": start.isoformat(), "endDate": end.isoformat(),
+                                        "resampleFreq": "5min", "afterHours": "false",
+                                        "columns": "open,high,low,close,volume"})
+        url = f"{DATA_PROVIDER_URL}/iex/{urllib.parse.quote(symbol.lower())}/prices?{query}"
+        rows = self._get_json(url)
+        if not isinstance(rows, list):
+            raise DataProviderError(f"{symbol}: expected a list of intraday rows")
+        return rows
 
     def history(self, symbols: Sequence[str], start: date, end: date
                 ) -> tuple[dict[str, BarSeries], dict[str, DatasetMeta]]:

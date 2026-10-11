@@ -209,8 +209,8 @@ def headline(snap: Snapshot | None, state: Any) -> tuple[str, str]:
                 "Nothing will trade until the setting below is fixed in Railway.")
     if snap is None or snap.state is None:
         return ("Getting ready.",
-                "Your simulated $10,000 account starts after the next market close, once the "
-                "day's prices are final.")
+                f"Your simulated {money(capital_of(state), False)} account starts after the next "
+                "market close, once the day's prices are final.")
     st = snap.state
     held = sorted(st.positions)
     buys = [o.symbol for o in st.pending if o.action != "exit"]
@@ -237,6 +237,10 @@ def headline(snap: Snapshot | None, state: Any) -> tuple[str, str]:
     return ("Watching, all in cash.",
             "None of your three funds is in an uptrend, so the bot is waiting. It only buys in "
             "confirmed uptrends.")
+
+
+def capital_of(state: Any) -> float:
+    return float(state.report.settings.capital_base_usd) if state.report else 1_000_000.0
 
 
 def join(items: Sequence[str]) -> str:
@@ -370,8 +374,8 @@ def money_section(snap: Snapshot) -> str:
                  f"aria-label='Account value since {snap.start_day}'>"
                  f"<line x1='0' x2='{w}' y1='{base_y:.1f}' y2='{base_y:.1f}' class='base'/>"
                  f"<polyline class='price' points='{pts}'/></svg>"
-                 "<p class='legend'>Account value each day. The dotted line is the $10,000 you "
-                 "started with.</p>")
+                 f"<p class='legend'>Account value each day. The dotted line is the "
+                 f"{money(start, False)} you started with.</p>")
     closed = snap.trades
     results = ""
     if closed:
@@ -414,7 +418,8 @@ def timeline_section(snap: Snapshot, symbols: Sequence[str]) -> str:
         if decs and not by_day[d]:
             by_day[d].append(f"Checked {join(symbols)}. No changes.")
     if started and started.session in by_day:
-        by_day[started.session].insert(0, "Started your simulated account with $10,000.")
+        by_day[started.session].insert(
+            0, f"Started your simulated account with {money(snap.state.initial_capital, False)}.")
     quiet = f"Checked {join(symbols)}. No changes."
     groups: list[tuple[date, date, list[str]]] = []
     for d in days:
@@ -512,6 +517,8 @@ html{-webkit-text-size-adjust:100%}
 body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 var(--body)}
 main{max-width:680px;margin:0 auto;padding:28px 18px 56px}
 .brand{font:600 15px/1 var(--display);letter-spacing:.01em;margin:0 0 26px;color:var(--quiet)}
+.brand a{color:var(--ink);text-decoration:none;border-bottom:1.5px solid var(--line)}
+a{color:inherit}
 h1{font:650 clamp(30px,8vw,44px)/1.08 var(--display);letter-spacing:-.02em;margin:0 0 12px;
 font-variation-settings:'opsz' 96}
 .lede{font-size:18px;margin:0 0 10px;max-width:36em}
@@ -582,6 +589,30 @@ footer p{margin:0 0 6px}
 footer .ok{color:var(--gain)}
 footer details{background:none;border:0}
 footer summary{font:600 14px/1.3 var(--body);color:var(--quiet);padding:6px 0;justify-content:flex-start}
+.board{list-style:none;margin:0;padding:0}
+.board li{margin:0 0 10px}
+.botrow{display:grid;grid-template-columns:28px 1fr auto;gap:4px 12px;padding:14px;background:var(--surface);
+border:1px solid var(--line);border-radius:14px;text-decoration:none;color:var(--ink)}
+.botrow:hover{border-color:var(--quiet)}
+.rank{font:650 20px/1.2 var(--display);color:var(--quiet)}
+.who{display:flex;flex-direction:column;gap:3px;min-width:0}
+.who b{font:650 18px/1.25 var(--display)}
+.status-line{color:var(--teal)}
+.nums{display:flex;flex-direction:column;align-items:flex-end;gap:3px;text-align:right}
+.val{font:650 18px/1.25 var(--display);font-variant-numeric:tabular-nums}
+@media (max-width:420px){.botrow{grid-template-columns:22px 1fr}.nums{grid-column:2;align-items:flex-start;
+flex-direction:row;flex-wrap:wrap;gap:4px 12px;text-align:left}}
+.scroll{overflow-x:auto}
+.acct{margin-top:28px}
+table.bt{border-collapse:collapse;width:100%;font-size:15px;font-variant-numeric:tabular-nums}
+table.bt th,table.bt td{text-align:left;padding:9px 10px 9px 0;border-bottom:1px solid var(--line);vertical-align:top}
+table.bt thead th{font:600 13px/1.3 var(--body);color:var(--quiet)}
+table.bt tbody th{font-weight:600}
+table.bt a{text-decoration:none;border-bottom:1.5px solid var(--line)}
+.daylist{list-style:none;margin:0;padding:0}
+.daylist li{display:grid;grid-template-columns:1fr auto auto;gap:12px;padding:8px 0;border-bottom:1px solid var(--line);
+align-items:baseline}
+.chart .buy{fill:var(--gain)} .chart .sell{fill:var(--loss)}
 .tech{padding:0 0 0 0;list-style:none;color:var(--quiet);font-size:13px;word-break:break-word}
 """
 
@@ -589,7 +620,8 @@ FONTS = ("https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght
          "&family=Public+Sans:wght@400;600;700&display=swap")
 
 
-def render_page(state: Any) -> str:
+def render_trend_page(state: Any) -> str:
+    """The daily trend-following account (one of the bots)."""
     symbols = list(state.report.settings.symbols) if state.report else list(FUNDS)
     snap = None
     body_main = ""
@@ -605,17 +637,24 @@ def render_page(state: Any) -> str:
         body_main = (money_section(snap) + funds_section(snap, symbols)
                      + timeline_section(snap, symbols))
     return _shell(state, big, sub, status_line(snap, state), body_main + how_section(state)
-                  + controls_section(state, snap), snap)
+                  + controls_section(state, snap), back=TREND_NAME)
 
 
-def _shell(state: Any, big: str, sub: str, status: str, body: str, snap: Any = None) -> str:
+TREND_NAME = "Slow trend follower"
+
+
+def _shell(state: Any, big: str, sub: str, status: str, body: str, *, back: str = "",
+           title: str = "Trading Lab", refresh: int = 0) -> str:
     now = datetime.now(UTC).astimezone(state.tz)
+    brand = (f'<p class="brand"><a href="/">← All bots</a> <span class="quiet">/ {esc(back)}</span></p>'
+             if back else '<p class="brand">Trading Lab <span class="quiet">(pretend money only)</span></p>')
+    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark"><title>Trading Lab</title>
+<meta name="color-scheme" content="light dark"><title>{esc(title)}</title>{meta}
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="{FONTS}"><style>{CSS}</style></head><body><main>
-<p class="brand">Trading Lab <span class="quiet">simulated account</span></p>
+{brand}
 <h1>{esc(big)}</h1><p class="lede">{esc(sub)}</p><p class="status">{esc(status)}</p>
 {notice(state)}
 {body}

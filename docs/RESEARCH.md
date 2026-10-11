@@ -66,3 +66,15 @@ decisions and equity values up to the cutoff are byte-identical.
 - Missing bar for a held symbol: marked at last close; pending order for it cancelled.
 - Positions open at the end of a window are closed at the final close with costs.
 - Walk-forward segments start flat (positions are closed at each segment boundary).
+
+## Day-trading bots: history tests
+
+- Fixed windows: training 2017-08-01 to 2022-12-31, validation 2023 to 2024, final test from
+  2025-01-01. Fixed dates mean no day ever moves between windows as history loads.
+- The final test is sealed per bot: it is not even run until you open it from the bot's page
+  (flag `unlock_test:<bot>`). After that, judge any change to the strategy on new live days.
+- Every bot uses the live core with $1,000,000, the same costs (2 bp per side, +3 bp on stops,
+  $0.005/share commission with a $1 minimum, SEC/FINRA fees) and limits. A 10% peak halt is
+  modelled as resumed after 20 trading days (live, it waits for you).
+- Benchmark: buy SPY at the last close before the window and hold it (price only).
+- Strategy parameters are round numbers fixed up front; nothing has been tuned.

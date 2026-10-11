@@ -2,6 +2,7 @@
 atomic commits, controls, and exact parity with the research backtester."""
 
 import unittest
+from decimal import Decimal
 from datetime import date, datetime, timedelta
 
 from tests.helpers import settings
@@ -60,7 +61,7 @@ class LifecycleTests(unittest.TestCase):
         self.assertEqual((rep.status, rep.processed), ("processed", [d]))
         self.assertEqual(store.events()[0].kind, "initialized")
         state = store.load_state()
-        self.assertEqual((state.last_session, state.initial_capital), (d, 10_000.0))
+        self.assertEqual((state.last_session, state.initial_capital), (d, 1_000_000.0))
 
     def test_before_settle_targets_previous_session(self):
         eng, store, _ = engine()
@@ -259,6 +260,31 @@ class ConfigAndSettleTests(unittest.TestCase):
         self.assertEqual(store.load_state().last_session, date(2019, 11, 27))
         eng.run(session(early).close_utc + timedelta(hours=7, minutes=31))  # 20:31 ET
         self.assertEqual(store.load_state().last_session, early)
+
+
+class CapitalRestartTests(unittest.TestCase):
+    def test_untraded_account_restarts_with_new_capital_traded_one_does_not(self):
+        from dataclasses import replace
+
+        store = InMemoryStore()
+        small = replace(settings(), capital_base_usd=Decimal("10000"))
+        LiveSimulationEngine(small, store, FlakySource(DATA), TrendFollowing.create()).run(
+            evening(date(2019, 3, 15)))
+        before = store.load_state()
+        self.assertEqual(before.initial_capital, 10_000.0)
+        self.assertTrue(before.pending)  # an order waiting for Monday, never filled
+        eng = LiveSimulationEngine(settings(), store, FlakySource(DATA), TrendFollowing.create())
+        eng.run(evening(date(2019, 3, 15)))
+        st = store.load_state()
+        self.assertEqual(st.initial_capital, float(settings().capital_base_usd))
+        self.assertEqual(st.last_session, date(2019, 3, 15))
+        self.assertGreater(sum(o.shares for o in st.pending), sum(o.shares for o in before.pending))
+        self.assertTrue(any(e.kind == "restarted" for e in store.events()))
+        eng.run(evening(date(2019, 3, 20)))  # fills happen: from now on it is a real history
+        self.assertTrue(store.fills())
+        LiveSimulationEngine(small, store, FlakySource(DATA), TrendFollowing.create()).run(
+            evening(date(2019, 3, 21)))
+        self.assertEqual(store.load_state().initial_capital, float(settings().capital_base_usd))
 
 
 class PriceHistoryTests(unittest.TestCase):

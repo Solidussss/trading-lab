@@ -54,5 +54,19 @@ whose terms explicitly allow storing data for internal use; only `marketdata/` c
   (Tiingo's corrections run until ~8 pm ET, including on early-close days).
 - **Revisions:** fills are final once processed (as in real trading). Research datasets are
   cached with SHA-256 checksums so backtests are reproducible.
-- **Intraday prices:** not used by the V1 strategy. Tiingo's free IEX endpoint returns a
-  derived reference price without an IEX agreement; it may be added for dashboard display.
+## Intraday prices (day-trading bots)
+
+- **Source:** Tiingo IEX endpoint, 5-minute bars, regular session only
+  (`/iex/<ticker>/prices?resampleFreq=5min&afterHours=false&columns=open,high,low,close,volume`).
+  History from August 2017; same free plan and "internal use only" licence.
+- **What it is:** trades on the IEX exchange only. For SPY/QQQ/IWM this tracks the market
+  closely; volume is IEX-only, so "the day's average price" (VWAP) is IEX VWAP.
+- **Budget:** one limiter for the whole process (45/hour, 900/day). Live bots: 3 requests per
+  5-minute poll, shared by every bot. The history loader only uses what's left and pauses
+  during market hours.
+- **Completeness and labels:** only bars that have fully closed are used. A day's data is
+  final once 90% of bars are in or 3 hours after the close; until then the day isn't
+  committed. The provider's time-stamp convention (start or end of each 5 minutes) is learned
+  once from a complete day. A shorter response never replaces more data already stored.
+- **Yesterday's close** (gap strategy) is the last 5-minute price of the previous session,
+  the same rule live and in history tests.

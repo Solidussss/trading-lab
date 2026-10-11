@@ -95,6 +95,46 @@ class SchemaTests(PgTestCase):
         other.close()
 
 
+class IntradayOnPostgresTests(PgTestCase):
+    def test_bot_day_round_trip_duplicate_refused_and_reset(self):
+        from tests.test_intraday import FakeFeed, at, runner_with
+        from tradinglab.intraday.live import BotSpec
+
+        feed = FakeFeed()
+        r, _ = runner_with(feed, store=self.store, bots=[BotSpec("orb", "orb"), BotSpec("gap", "gap")])
+        r.run(datetime(2024, 3, 2, 18, tzinfo=UTC))
+        for d in trading_days(date(2024, 3, 4), date(2024, 3, 8)):
+            r.run(at(d, "16:30"))
+        mem, _ = runner_with(feed, bots=r.bots)
+        mem.run(datetime(2024, 3, 2, 18, tzinfo=UTC))
+        for d in trading_days(date(2024, 3, 4), date(2024, 3, 8)):
+            mem.run(at(d, "16:30"))
+        for b in ("orb", "gap"):
+            self.assertEqual(self.store.load_bot(b), mem.store.load_bot(b))
+            self.assertEqual(self.store.bot_days(b), mem.store.bot_days(b))
+            self.assertEqual(self.store.bot_trades(b), mem.store.bot_trades(b))
+            d = date(2024, 3, 6)
+            self.assertEqual(self.store.bot_fills(b, d), mem.store.bot_fills(b, d))
+            self.assertEqual(self.store.bot_signals(b, d), mem.store.bot_signals(b, d))
+        self.assertEqual(self.store.ibars("SPY", date(2024, 3, 5)), mem.store.ibars("SPY", date(2024, 3, 5)))
+        from tradinglab.intraday.core import DayResult
+
+        with self.assertRaises(ValueError):
+            self.store.commit_bot_day("orb", self.store.load_bot("orb"),
+                                      DayResult(date(2024, 3, 6), 1.0, 1.0, True))
+        self.store.save_backtest("orb", {"x": [1, 2.5], "nan": float("nan")})
+        self.assertEqual(self.store.backtest("orb"), {"x": [1, 2.5], "nan": None})
+        self.store.reset_bot("orb")
+        self.assertIsNone(self.store.load_bot("orb"))
+        self.assertEqual(self.store.bot_days("orb"), [])
+        self.assertTrue(self.store.bot_days("gap"))
+
+    def test_intraday_and_daily_locks_are_independent(self):
+        with self.store.run_lock("engine"):
+            with self.store.run_lock("intraday"):
+                pass
+
+
 class EngineOnPostgresTests(PgTestCase):
     def test_runs_and_double_commit_refused(self):
         eng = self.engine()

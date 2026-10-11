@@ -41,7 +41,7 @@ __all__ = ["BacktestConfig", "BacktestResult", "Backtester", "Decision", "Equity
 class BacktestConfig:
     start: date
     end: date
-    initial_capital: float = 10_000.0
+    initial_capital: float = 1_000_000.0
     risk: RiskParams = field(default_factory=RiskParams)
     costs: CostModel = field(default_factory=CostModel)
 

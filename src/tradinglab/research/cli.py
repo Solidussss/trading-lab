@@ -124,9 +124,9 @@ def cmd_baseline(args: argparse.Namespace) -> int:
     bench_rows = []
     for w in (splits.train, splits.validation):
         bench_rows.append(benchmark_stats(f"SPY 100% B&H ({w.name})",
-                                          buy_and_hold(data["SPY"], w.start, w.end, 10_000)))
+                                          buy_and_hold(data["SPY"], w.start, w.end, 1_000_000)))
         bench_rows.append(benchmark_stats(f"SPY 30% B&H ({w.name})",
-                                          buy_and_hold(data["SPY"], w.start, w.end, 10_000, 0.30)))
+                                          buy_and_hold(data["SPY"], w.start, w.end, 1_000_000, 0.30)))
 
     rows = [("Train (optimised)", compute_metrics(train_res)),
             ("Validation (best params)", compute_metrics(val_res)),
@@ -155,7 +155,7 @@ def cmd_baseline(args: argparse.Namespace) -> int:
               "about real markets.**\n\n" if synthetic else "")
     md = f"""# Baseline study: trend following v1
 
-{banner}Generated {datetime.now(UTC):%Y-%m-%d %H:%M UTC}. Capital $10,000, risk 0.5%/trade,
+{banner}Generated {datetime.now(UTC):%Y-%m-%d %H:%M UTC}. Capital $1,000,000, risk 0.5%/trade,
 30% max exposure, 3 max positions, conservative costs (~10 bp round trip + fees).
 
 **Splits** train {splits.train.start}→{splits.train.end} · validation

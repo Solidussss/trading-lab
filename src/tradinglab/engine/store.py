@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any, Protocol
 
+from tradinglab.engine.intraday_store import InMemoryIntradayStore
 from tradinglab.marketdata.bars import Bar
 from tradinglab.sim.core import Decision, EquityPoint, Fill, PortfolioState, StepResult, Trade
 
@@ -59,7 +60,7 @@ class Store(Protocol):
     def price_history(self, symbol: str, n: int = 320) -> list[Bar]: ...
 
 
-class InMemoryStore:
+class InMemoryStore(InMemoryIntradayStore):
     def __init__(self) -> None:
         self._state: dict[str, Any] | None = None
         self._decisions: list[Decision] = []
@@ -71,6 +72,7 @@ class InMemoryStore:
         self._flags: dict[str, list[tuple[datetime, bool]]] = {}  # name -> history
         self._prices: dict[str, dict[date, Bar]] = {}  # display-only price history
         self._lock = threading.Lock()
+        self._locks = {"engine": self._lock, "intraday": threading.Lock()}
         self.fail_next_commit = False  # failure injection for atomicity tests
 
     def load_state(self) -> PortfolioState | None:
@@ -145,11 +147,20 @@ class InMemoryStore:
         bars = self._prices.get(symbol, {})
         return [bars[d] for d in sorted(bars)][-n:]
 
+    def official_close(self, symbol, day):
+        bar = self._prices.get(symbol, {}).get(day)
+        return bar.close if bar else None
+
+    def reset_daily_account(self):
+        self._state, self._decisions, self._fills, self._trades = None, [], [], []
+        self._curve, self._bars = [], {}
+
     @contextlib.contextmanager
-    def run_lock(self) -> Iterator[None]:
-        if not self._lock.acquire(blocking=False):
-            raise EngineBusyError("another engine run is in progress")
+    def run_lock(self, name: str = "engine") -> Iterator[None]:
+        lock = self._locks[name]
+        if not lock.acquire(blocking=False):
+            raise EngineBusyError(f"another {name} run is in progress")
         try:
             yield
         finally:
-            self._lock.release()
+            lock.release()

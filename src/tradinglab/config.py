@@ -163,7 +163,7 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         intraday_loss_halt_pct=_decimal(env, "INTRADAY_LOSS_HALT_PCT", "0.03"),
         peak_drawdown_halt_pct=_decimal(env, "PEAK_DRAWDOWN_HALT_PCT", "0.10"),
     )
-    capital = _decimal(env, "CAPITAL_BASE_USD", "10000")
+    capital = _decimal(env, "CAPITAL_BASE_USD", "1000000")
     _range("CAPITAL_BASE_USD", capital, HARD_MAX_CAPITAL_BASE, minimum=Decimal("100"))
 
     symbols = tuple(

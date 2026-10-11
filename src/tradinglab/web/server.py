@@ -73,6 +73,7 @@ class AppState:
         self.controls = controls  # LiveSimulationEngine used for pause/resume
         self.scheduler = scheduler
         self.engine_note = ""
+        self.intraday: Any = None  # IntradayRunner, for the dashboard's "today so far"
         self._failures: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
@@ -153,10 +154,17 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
             path = self.path.split("?", 1)[0]
             if path == "/healthz":
                 return self._send(HTTPStatus.OK, "ok\n")
-            if path != "/":
+            if path != "/" and not path.startswith("/bot/"):
                 return self._send(HTTPStatus.NOT_FOUND, "not found\n")
             if not self._authorised():
                 return None
+            if path.startswith("/bot/"):
+                from tradinglab.web.views_bots import bot_page
+
+                page = bot_page(state, path[5:])
+                if page is None:
+                    return self._send(HTTPStatus.NOT_FOUND, "not found\n")
+                return self._send(HTTPStatus.OK, page, "text/html; charset=utf-8")
             return self._send(HTTPStatus.OK, render_page(state), "text/html; charset=utf-8")
 
         def do_POST(self):  # noqa: N802
@@ -184,11 +192,20 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 state.controls.resume()
             elif action == "resume_drawdown":
                 state.controls.resume_after_drawdown()
+            elif action.startswith("resume_bot:") and state.intraday is not None \
+                    and action[11:] in {b.id for b in state.intraday.bots}:
+                state.intraday.resume_bot(action[11:])
+            elif action.startswith("unlock_test:") and state.intraday is not None \
+                    and action[12:] in {b.id for b in state.intraday.bots}:
+                state.store.set_flag(action, True)
+                state.store.add_event(_event("final_test_opened", action[12:]))
             else:
                 return self._send(HTTPStatus.BAD_REQUEST, "unknown action\n")
             log.warning("control action %r by %s", action, self._client())
             self.send_response(HTTPStatus.SEE_OTHER)
-            self.send_header("Location", "/")
+            ref = urllib.parse.urlsplit(self.headers.get("Referer") or "")
+            back = ref.path if ref.netloc == host and ref.path.startswith("/bot/") else "/"
+            self.send_header("Location", back)
             for k, v in SECURITY_HEADERS.items():
                 self.send_header(k, v)
             self.send_header("Content-Length", "0")
@@ -202,9 +219,17 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
 
 
 def render_page(state: AppState) -> str:
-    from tradinglab.web.views import render_page as _render
+    from tradinglab.web.views_bots import leaderboard_page
 
-    return _render(state)
+    return leaderboard_page(state)
+
+
+def _event(kind: str, detail: str):
+    from datetime import UTC, datetime
+
+    from tradinglab.engine.store import EngineEvent
+
+    return EngineEvent(datetime.now(UTC), None, kind, detail)
 
 
 # --- process entry point ------------------------------------------------------------------
@@ -233,7 +258,19 @@ def build_state(env: Mapping[str, str]) -> AppState:
         state.store = None
         state.engine_note = f"Database unavailable at startup: {type(exc).__name__}: {exc}"
         return state
-    sched = Scheduler(lambda: build_engine(settings, postgres_store(settings)))
+    from tradinglab.engine.runtime import ResearchJob, build_intraday
+
+    state.intraday = build_intraday(settings, state.store)
+
+    def extra_jobs():
+        store = postgres_store(settings)
+        runner = build_intraday(settings, store)
+        research = ResearchJob(runner, TiingoClient(settings.require_data_token()))
+        return [("day-trading bots", runner.run), ("research", research.check)]
+
+    from tradinglab.marketdata.tiingo import TiingoClient
+
+    sched = Scheduler(lambda: build_engine(settings, postgres_store(settings)), extra_jobs=extra_jobs)
     state.scheduler = sched
     sched.start()
     return state

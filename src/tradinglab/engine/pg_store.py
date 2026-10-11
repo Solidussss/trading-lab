@@ -21,11 +21,13 @@ from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, date, datetime
 from typing import Any
 
+from tradinglab.engine.pg_intraday import INTRADAY_MIGRATION, IntradayPgMixin
 from tradinglab.engine.store import EngineBusyError, EngineEvent
 from tradinglab.marketdata.bars import Bar
 from tradinglab.sim.core import Decision, EquityPoint, Fill, PortfolioState, StepResult, Trade
 
 ADVISORY_LOCK_KEY = 7_401_552_093  # arbitrary, fixed: "trading-lab engine run"
+LOCK_KEYS = {"engine": ADVISORY_LOCK_KEY, "intraday": ADVISORY_LOCK_KEY + 1}
 
 MIGRATIONS: list[str] = [
     # 1: initial schema
@@ -121,6 +123,8 @@ MIGRATIONS: list[str] = [
         PRIMARY KEY (symbol, day)
     );
     """,
+    # 3: day-trading bots (shared 5-minute prices, one account per bot, history tests)
+    INTRADAY_MIGRATION,
 ]
 
 
@@ -155,7 +159,9 @@ def _list_to_bar(v: list | None) -> Bar | None:
     return Bar(date.fromisoformat(v[0]), *[float(x) for x in v[1:]])
 
 
-class PostgresStore:
+class PostgresStore(IntradayPgMixin):
+    _json = staticmethod(_json)
+
     def __init__(self, connect: Callable[[], Any]) -> None:
         self._connect = connect
         self._conn: Any = None
@@ -354,6 +360,16 @@ class PostgresStore:
                     "volume = EXCLUDED.volume, dividend = EXCLUDED.dividend, split = EXCLUDED.split",
                     (symbol, b.day, b.open, b.high, b.low, b.close, b.volume, b.dividend, b.split))
 
+    def official_close(self, symbol: str, day: date) -> float | None:
+        rows = self._query("SELECT close FROM prices WHERE symbol = %s AND day = %s", (symbol, day))
+        return float(rows[0][0]) if rows else None
+
+    def reset_daily_account(self) -> None:
+        """Start the daily account over (used only while it has never traded)."""
+        with self._tx() as cur:
+            for table in ("equity", "trades", "fills", "decisions", "sessions", "engine_state"):
+                cur.execute(f"DELETE FROM {table}")  # noqa: S608 - fixed table names
+
     def price_history(self, symbol: str, n: int = 320) -> list[Bar]:
         rows = self._query("SELECT day, open, high, low, close, volume, dividend, split FROM prices "
                            "WHERE symbol = %s ORDER BY day DESC LIMIT %s", (symbol, n))
@@ -362,18 +378,19 @@ class PostgresStore:
     # -- concurrency -----------------------------------------------------------------------
 
     @contextlib.contextmanager
-    def run_lock(self) -> Iterator[None]:
+    def run_lock(self, name: str = "engine") -> Iterator[None]:
+        key = LOCK_KEYS[name]
         conn = self._connect()
         conn.autocommit = True
         try:
             cur = conn.cursor()
-            cur.execute("SELECT pg_try_advisory_lock(%s)", (ADVISORY_LOCK_KEY,))
+            cur.execute("SELECT pg_try_advisory_lock(%s)", (key,))
             if not cur.fetchone()[0]:
-                raise EngineBusyError("another engine run is in progress")
+                raise EngineBusyError(f"another {name} run is in progress")
             try:
                 yield
             finally:
-                cur.execute("SELECT pg_advisory_unlock(%s)", (ADVISORY_LOCK_KEY,))
+                cur.execute("SELECT pg_advisory_unlock(%s)", (key,))
         finally:
             conn.close()
 
