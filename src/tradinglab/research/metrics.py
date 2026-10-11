@@ -111,6 +111,7 @@ def compute_metrics(result: BacktestResult, risk_free_rate: float = 0.0) -> Metr
 def buy_and_hold(series: BarSeries, start: date, end: date, capital: float,
                  fraction: float = 1.0, costs: CostModel | None = None) -> list[EquityPoint]:
     """Buy `fraction` of capital at the first open in range, hold, mark at each close.
+    Cash dividends are credited (not reinvested) and splits rescale shares.
 
     fraction=1.0 is the classic benchmark; fraction equal to the strategy's exposure cap
     (0.30) is the fair comparison for a strategy that can never be more than 30% invested.
@@ -125,9 +126,13 @@ def buy_and_hold(series: BarSeries, start: date, end: date, capital: float,
     shares = math.floor(capital * fraction / px)
     cash = capital - shares * px
     out = []
-    for d in days:
+    for i, d in enumerate(days):
         bar = series.bar_on(d)
         assert bar is not None
+        if i > 0:  # same corporate-action treatment as the simulator
+            if bar.split != 1.0:
+                shares = math.floor(shares * bar.split + 1e-9)
+            cash += shares * bar.dividend
         mv = shares * bar.close
         eq = cash + mv
         out.append(EquityPoint(d, eq, cash, mv / eq, 1 if shares else 0, False))

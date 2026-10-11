@@ -2,9 +2,10 @@
 
 Two sources are used, and they must agree before the live engine trades:
   1. This rules-based calendar (deterministic, offline, used by backtests).
-  2. Alpaca's /v2/calendar endpoint (authoritative for the live engine).
-`cross_check()` compares them; any disagreement makes the engine skip the session
-(fail closed) and logs a calendar_mismatch decision.
+  2. The data provider's bars: a bar on a day the rules call closed is flagged and ignored;
+     a missing bar on a rules trading day makes the live engine wait for data (and, after
+     a grace period, record a data gap - e.g. an unscheduled closure).
+`cross_check()` compares the rules calendar with any external list of sessions.
 
 All session times are expressed in America/New_York and converted with zoneinfo, so
 daylight-saving transitions are handled by the tz database rather than by hand.
@@ -165,7 +166,7 @@ def previous_trading_day(d: date) -> date:
 
 
 def ny_date(ts: datetime) -> date:
-    """Session date of a timestamp (Alpaca daily bars are stamped at 00:00 New York time)."""
+    """Session date of an aware timestamp, in New York time."""
     if ts.tzinfo is None:
         raise ValueError("naive datetimes are ambiguous; pass an aware timestamp.")
     return ts.astimezone(NY).date()
@@ -174,10 +175,9 @@ def ny_date(ts: datetime) -> date:
 def last_completed_session(now_utc: datetime, settle_minutes: int = 20) -> date:
     """Most recent session whose daily bar is final and queryable on the free SIP rule.
 
-    A session counts as complete `settle_minutes` after its close: the free Basic plan only
-    allows SIP queries whose end is at least 15 minutes old, and late prints settle shortly
-    after the close. Evaluating before that would act on an incomplete bar (look-ahead risk
-    in reverse: a bar that later changes).
+    A session counts as complete `settle_minutes` after its close, once the provider has
+    published and corrected the day's bar. Acting earlier would use a bar that may still
+    change.
     """
     if now_utc.tzinfo is None:
         raise ValueError("now_utc must be timezone-aware.")

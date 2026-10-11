@@ -1,14 +1,12 @@
-"""Process-wide network guard (defence in depth).
+"""Process-wide network guard enforcing the egress policy (defence in depth).
 
-Installs a Python audit hook that inspects every DNS lookup and socket connect made by
-*any* library in this process - alpaca-py, requests, httpx, websockets, urllib, etc.
-If the target is a live Alpaca host, or an Alpaca host not on the allowlist, the call
-raises before a packet leaves the machine.
+Installs a Python audit hook that inspects every DNS lookup, socket connect and
+http.client connection (including the CONNECT tunnel target behind a proxy) made by any
+library in this process. Destinations outside the egress policy raise before a packet is
+sent. Audit hooks cannot be removed once installed.
 
-Audit hooks cannot be removed once installed (by design), so a bug elsewhere, a library
-default, or an injected URL cannot route around the guard at runtime.
-
-This complements, and does not replace, the URL validation in the broker factory.
+Limits (see docs/SAFETY.md): libraries that resolve and connect in C (e.g. uvloop) do not
+raise audit events; the startup self-check refuses non-standard event loops for that reason.
 """
 
 from __future__ import annotations
@@ -16,21 +14,21 @@ from __future__ import annotations
 import logging
 import sys
 import threading
+from collections.abc import Iterable
 from typing import Any
 
 from tradinglab.safety.endpoints import (
-    EndpointNotAllowedError,
-    LiveTradingForbiddenError,
-    check_alpaca_host,
-    is_alpaca_host,
+    BrokerageForbiddenError,
+    EgressDeniedError,
+    EgressPolicy,
 )
 
 log = logging.getLogger(__name__)
 
 _lock = threading.Lock()
 _installed = False
+_policy = EgressPolicy()
 _blocked_attempts: list[str] = []
-
 
 _EVENTS = frozenset(
     {"socket.getaddrinfo", "socket.gethostbyname", "socket.connect", "http.client.connect"}
@@ -38,67 +36,63 @@ _EVENTS = frozenset(
 
 
 def _extract_hosts(event: str, args: tuple[Any, ...]) -> list[str]:
-    """Hosts referenced by an audit event. For http.client this includes the CONNECT
-    tunnel target, so a request routed through an HTTPS proxy is still inspected."""
     hosts: list[str] = []
-    if event == "http.client.connect":
-        # args: (connection, host, port)
-        try:
+    try:
+        if event == "http.client.connect":  # (connection, host, port)
             conn, host = args[0], args[1]
-        except IndexError:
-            return hosts
-        for h in (host, getattr(conn, "_tunnel_host", None)):
+            for h in (host, getattr(conn, "_tunnel_host", None)):
+                if isinstance(h, str | bytes):
+                    hosts.append(h.decode("ascii", "ignore") if isinstance(h, bytes) else h)
+        elif event in ("socket.getaddrinfo", "socket.gethostbyname"):
+            h = args[0]
+            if isinstance(h, bytes):
+                h = h.decode("ascii", "ignore")
             if isinstance(h, str):
                 hosts.append(h)
-        return hosts
-    single = _extract_host(event, args)
-    return [single] if single else hosts
-
-
-def _extract_host(event: str, args: tuple[Any, ...]) -> str | None:
-    try:
-        if event == "socket.getaddrinfo":
-            # args: (host, port, family, type, proto, flags)
-            host = args[0]
-        elif event == "socket.gethostbyname":
-            host = args[0]
-        elif event == "socket.connect":
-            # args: (socket, address); address is (host, port[, ...]) for INET sockets
+        elif event == "socket.connect":  # (socket, address)
             address = args[1]
-            host = address[0] if isinstance(address, tuple) and address else None
-        else:
-            return None
+            if isinstance(address, tuple) and address and isinstance(address[0], str):
+                hosts.append(address[0])
     except (IndexError, TypeError):
-        return None
-    if isinstance(host, bytes):
-        host = host.decode("ascii", "ignore")
-    return host if isinstance(host, str) else None
+        pass
+    return hosts
 
 
 def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
     if event not in _EVENTS:
         return
     for host in _extract_hosts(event, args):
+        if event == "socket.getaddrinfo" and host in ("", None):
+            continue
         try:
-            # is_alpaca_host IDNA-normalises first; unconvertible non-ASCII hosts raise.
-            if not is_alpaca_host(host):
-                continue
-            check_alpaca_host(host)
-        except (LiveTradingForbiddenError, EndpointNotAllowedError) as exc:
+            _policy.check(host)
+        except (BrokerageForbiddenError, EgressDeniedError) as exc:
             _blocked_attempts.append(host)
             log.critical("NETWORK GUARD blocked %s to %r: %s", event, host, exc)
             raise
 
 
-def install_network_guard() -> None:
-    """Install the audit hook once per process. Safe to call repeatedly."""
+def install_network_guard(extra_allowed: Iterable[str] = ()) -> None:
+    """Install the audit hook once per process and add hosts to the egress allowlist."""
     global _installed
     with _lock:
-        if _installed:
-            return
-        sys.addaudithook(_audit_hook)
-        _installed = True
-        log.info("Paper-only network guard installed.")
+        extra = list(extra_allowed)
+        if extra:
+            _policy.allow(extra)
+        if not _installed:
+            sys.addaudithook(_audit_hook)
+            _installed = True
+            log.info("Egress guard installed; allowed hosts: %s",
+                     ", ".join(sorted(_policy.allowed_hosts)))
+
+
+def freeze_egress() -> None:
+    """Prevent any further widening of the allowlist (production calls this at startup)."""
+    _policy.freeze()
+
+
+def policy() -> EgressPolicy:
+    return _policy
 
 
 def is_installed() -> bool:
@@ -106,5 +100,4 @@ def is_installed() -> bool:
 
 
 def blocked_attempts() -> list[str]:
-    """Hosts the guard has blocked in this process (for health checks and tests)."""
     return list(_blocked_attempts)

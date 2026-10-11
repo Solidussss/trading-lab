@@ -1,11 +1,15 @@
-"""Fail-closed configuration.
+"""Fail-closed configuration for a simulation-only trading lab.
 
 Every setting is read from environment variables (Railway service variables in production,
 a git-ignored .env locally). If anything is missing, malformed, out of range, or ambiguous,
 `load_settings()` raises ConfigError and the process must not start.
 
-Secrets are wrapped in `Secret`, whose repr/str never reveal the value, so they cannot leak
-through logs, tracebacks, or the dashboard.
+There is no brokerage configuration of any kind. Variables that look like brokerage
+credentials are treated as a configuration error, so a broker key can never be loaded
+"just in case".
+
+Secrets are wrapped in `Secret`, whose repr/str/format never reveal the value and which
+cannot be pickled.
 """
 
 from __future__ import annotations
@@ -15,8 +19,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Final
+from urllib.parse import urlsplit
 
-from tradinglab.safety.endpoints import PAPER_TRADING_URL, validate_trading_url
+from tradinglab.safety.endpoints import DEFAULT_ALLOWED_HOSTS, is_brokerage_host, normalize_host
 
 
 class ConfigError(RuntimeError):
@@ -24,7 +29,7 @@ class ConfigError(RuntimeError):
 
 
 # --- Hard ceilings: configuration can tighten these, never loosen them. -------------------
-HARD_MAX_RISK_PER_TRADE: Final = Decimal("0.02")  # 2% of equity
+HARD_MAX_RISK_PER_TRADE: Final = Decimal("0.02")
 HARD_MAX_EXPOSURE: Final = Decimal("1.00")  # 100% of capital => no leverage, ever
 HARD_MAX_OPEN_POSITIONS: Final = 10
 HARD_MAX_INTRADAY_HALT: Final = Decimal("0.10")
@@ -33,28 +38,23 @@ HARD_MAX_CAPITAL_BASE: Final = Decimal("1000000")
 
 ALLOWED_APP_ENVS: Final = frozenset({"development", "test", "production"})
 SYMBOL_RE: Final = re.compile(r"^[A-Z]{1,5}$")
-
-# Environment variables that make the credential source ambiguous. If any is present the
-# app refuses to start instead of guessing which keys/URL alpaca-py might pick up.
-AMBIGUOUS_ENV_VARS: Final = (
-    "APCA_API_KEY_ID",
-    "APCA_API_SECRET_KEY",
-    "APCA_API_BASE_URL",
-    "APCA_API_DATA_URL",
-    "ALPACA_API_KEY",
-    "ALPACA_SECRET_KEY",
-    "ALPACA_API_SECRET",
-    "ALPACA_BASE_URL",
-    "ALPACA_ENDPOINT",
-)
-_LIVE_ENV_NAME_RE: Final = re.compile(r"(ALPACA|APCA).*LIVE|LIVE.*(ALPACA|APCA)")
+TIINGO_TOKEN_RE: Final = re.compile(r"^[A-Za-z0-9]{20,64}$")
+ANTHROPIC_KEY_RE: Final = re.compile(r"^sk-ant-[A-Za-z0-9_\-]{20,200}$")
+_DECIMAL_RE: Final = re.compile(r"^-?\d+(\.\d+)?$")
 _TRUE: Final = frozenset({"true", "1", "yes"})
 _FALSE: Final = frozenset({"false", "0", "no"})
-_DECIMAL_RE: Final = re.compile(r"^-?\d+(\.\d+)?$")
+
+# Any variable whose name looks like brokerage configuration aborts startup.
+BROKERAGE_ENV_RE: Final = re.compile(
+    r"^(ALPACA|APCA|IBKR|IB_|TWS_|QUESTRADE|WEALTHSIMPLE|TRADIER|SCHWAB|TDA_|TDAMERITRADE|"
+    r"ETRADE|ROBINHOOD|TASTY|WEBULL|MOOMOO|FUTU|TRADESTATION|OANDA|FXCM|COINBASE|KRAKEN|"
+    r"BINANCE|BROKER)|_BROKER(_|$)|LIVE_TRADING|REAL_MONEY",
+    re.IGNORECASE,
+)
 
 
 class Secret:
-    """Holds a secret string; never reveals it via str/repr/format."""
+    """Holds a secret string; never reveals it via str/repr/format and refuses pickling."""
 
     __slots__ = ("_value",)
 
@@ -72,10 +72,10 @@ class Secret:
     def __format__(self, spec: str) -> str:
         return repr(self)
 
-    def __reduce__(self):  # refuse pickling/copying to disk, queues, caches
+    def __reduce__(self):
         raise TypeError("Secret values cannot be pickled.")
 
-    def __eq__(self, other: object) -> bool:  # pragma: no cover - convenience only
+    def __eq__(self, other: object) -> bool:  # pragma: no cover
         return isinstance(other, Secret) and other._value == self._value
 
     def __hash__(self) -> int:  # pragma: no cover
@@ -105,55 +105,53 @@ class RiskLimits:
 @dataclass(frozen=True)
 class Settings:
     app_env: str
-    alpaca_api_key: Secret = field(repr=False)
-    alpaca_secret_key: Secret = field(repr=False)
-    order_submission_enabled: bool
     capital_base_usd: Decimal
     symbols: tuple[str, ...]
     risk: RiskLimits
-    trading_mode: str = "paper"
-    trading_base_url: str = PAPER_TRADING_URL
+    data_token: Secret | None = field(default=None, repr=False)
+    anthropic_key: Secret | None = field(default=None, repr=False)
+    database_url: Secret | None = field(default=None, repr=False)
+    egress_hosts: frozenset[str] = DEFAULT_ALLOWED_HOSTS
+    trading_mode: str = "simulated"
 
     def __post_init__(self) -> None:
-        # Belt and braces: even a hand-constructed Settings cannot describe live trading.
-        if self.trading_mode != "paper":
-            raise ConfigError("trading_mode must be 'paper'.")
-        validate_trading_url(self.trading_base_url)
+        if self.trading_mode != "simulated":
+            raise ConfigError("trading_mode must be 'simulated'. Real trading is not supported.")
+
+    def require_data_token(self) -> Secret:
+        if self.data_token is None:
+            raise ConfigError("TIINGO_API_TOKEN is required for market-data access.")
+        return self.data_token
 
 
 def load_settings(env: Mapping[str, str]) -> Settings:
     """Build Settings from an environment mapping (pass `os.environ` in production)."""
-    _reject_ambiguous(env)
+    _reject_brokerage_and_proxies(env)
 
     app_env = _required(env, "APP_ENV")
-    if app_env not in ALLOWED_APP_ENVS:  # exact, lower-case
+    if app_env not in ALLOWED_APP_ENVS:
         raise ConfigError(f"APP_ENV must be one of {sorted(ALLOWED_APP_ENVS)}.")
-    # An HTTP(S) proxy hides the real destination from the socket-level network guard
-    # (requests/urllib3 connect only to the proxy). Refused in every environment.
-    proxies = sorted(
-        n for n in env
-        if n.upper().endswith("_PROXY") and n.upper() != "NO_PROXY" and env[n].strip()
-    )
-    if proxies:
-        raise ConfigError(
-            "Proxy variables " + ", ".join(proxies) + " are not allowed: they would hide "
-            "broker destinations from the paper-only network guard."
-        )
 
-    mode = _required(env, "TRADING_MODE")
-    if mode != "paper":
-        # Exact match only: "Paper", "paper ", "live", "both" all fail.
-        raise ConfigError("TRADING_MODE must be exactly 'paper'. Live trading is not supported.")
+    if _required(env, "TRADING_MODE") != "simulated":
+        raise ConfigError("TRADING_MODE must be exactly 'simulated'. Real trading is not supported.")
 
-    # Wrap secrets immediately so the raw strings never sit in this frame's locals, where
-    # error trackers that capture local variables could record them.
-    api_key = Secret(_required(env, "ALPACA_PAPER_API_KEY"))
-    api_secret = Secret(_required(env, "ALPACA_PAPER_SECRET_KEY"))
-    _validate_paper_key_id(api_key)
-    if len(api_secret.get()) < 20 or not api_secret.get().isprintable():
-        raise ConfigError("ALPACA_PAPER_SECRET_KEY looks malformed.")
-    if api_key.get() == api_secret.get():
-        raise ConfigError("API key and secret must differ.")
+    data_token = None
+    if "TIINGO_API_TOKEN" in env:
+        data_token = Secret(_optional(env, "TIINGO_API_TOKEN", ""))
+        if not TIINGO_TOKEN_RE.match(data_token.get()):
+            raise ConfigError("TIINGO_API_TOKEN looks malformed.")
+
+    anthropic_key = None
+    if "ANTHROPIC_API_KEY" in env:
+        anthropic_key = Secret(_optional(env, "ANTHROPIC_API_KEY", ""))
+        if not ANTHROPIC_KEY_RE.match(anthropic_key.get()):
+            raise ConfigError("ANTHROPIC_API_KEY looks malformed.")
+
+    egress = set(DEFAULT_ALLOWED_HOSTS)
+    database_url = None
+    if "DATABASE_URL" in env:
+        database_url = Secret(_optional(env, "DATABASE_URL", ""))
+        egress.add(_database_host(database_url))
 
     risk = RiskLimits(
         risk_per_trade_pct=_decimal(env, "RISK_PER_TRADE_PCT", "0.005"),
@@ -162,7 +160,6 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         intraday_loss_halt_pct=_decimal(env, "INTRADAY_LOSS_HALT_PCT", "0.03"),
         peak_drawdown_halt_pct=_decimal(env, "PEAK_DRAWDOWN_HALT_PCT", "0.10"),
     )
-
     capital = _decimal(env, "CAPITAL_BASE_USD", "10000")
     _range("CAPITAL_BASE_USD", capital, HARD_MAX_CAPITAL_BASE, minimum=Decimal("100"))
 
@@ -175,46 +172,43 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         raise ConfigError("SYMBOLS contains duplicates.")
 
     return Settings(
-        app_env=app_env,
-        alpaca_api_key=api_key,
-        alpaca_secret_key=api_secret,
-        order_submission_enabled=_bool(env, "ORDER_SUBMISSION_ENABLED", default=False),
-        capital_base_usd=capital,
-        symbols=symbols,
-        risk=risk,
+        app_env=app_env, capital_base_usd=capital, symbols=symbols, risk=risk,
+        data_token=data_token, anthropic_key=anthropic_key, database_url=database_url,
+        egress_hosts=frozenset(egress),
     )
 
 
 # --- helpers ------------------------------------------------------------------------------
 
 
-def _reject_ambiguous(env: Mapping[str, str]) -> None:
-    present = [name for name in AMBIGUOUS_ENV_VARS if name in env]
-    if present:
+def _reject_brokerage_and_proxies(env: Mapping[str, str]) -> None:
+    brokerage = sorted(n for n in env if BROKERAGE_ENV_RE.search(n))
+    if brokerage:
         raise ConfigError(
-            "Ambiguous broker configuration: remove "
-            + ", ".join(sorted(present))
-            + ". Use ALPACA_PAPER_API_KEY / ALPACA_PAPER_SECRET_KEY only."
+            "Brokerage-style variables found: " + ", ".join(brokerage) + ". Trading Lab is "
+            "simulation-only and never loads brokerage credentials. Remove them."
         )
-    live_named = sorted(n for n in env if _LIVE_ENV_NAME_RE.search(n.upper()))
-    if live_named:
+    # A proxy hides real destinations from the socket-level egress guard. Refused everywhere.
+    proxies = sorted(
+        n for n in env
+        if n.upper().endswith("_PROXY") and n.upper() != "NO_PROXY" and env[n].strip()
+    )
+    if proxies:
         raise ConfigError(
-            "Live-trading style variables found: " + ", ".join(live_named) + ". Remove them."
+            "Proxy variables " + ", ".join(proxies) + " are not allowed: they would hide "
+            "network destinations from the egress guard."
         )
 
 
-def _validate_paper_key_id(key: Secret) -> None:
-    if not key.get().isalnum():
-        raise ConfigError("ALPACA_PAPER_API_KEY looks malformed.")
-    if key.get().upper().startswith("AK"):
-        raise ConfigError("ALPACA_PAPER_API_KEY looks like a LIVE key (prefix 'AK'). Refusing.")
-    if not key.get().upper().startswith("PK"):
-        raise ConfigError(
-            "ALPACA_PAPER_API_KEY must be a paper key (prefix 'PK'). "
-            "Unrecognised key formats are refused."
-        )
-    if len(key.get()) < 16:
-        raise ConfigError("ALPACA_PAPER_API_KEY looks too short.")
+def _database_host(url: Secret) -> str:
+    parts = urlsplit(url.get())
+    if parts.scheme not in ("postgresql", "postgres", "postgresql+psycopg"):
+        raise ConfigError("DATABASE_URL must be a postgresql:// URL.")
+    if not parts.hostname:
+        raise ConfigError("DATABASE_URL has no host.")
+    if is_brokerage_host(parts.hostname):
+        raise ConfigError("DATABASE_URL points at a brokerage domain; refused.")
+    return normalize_host(parts.hostname)
 
 
 def _required(env: Mapping[str, str], name: str) -> str:
@@ -244,10 +238,8 @@ def _decimal(env: Mapping[str, str], name: str, default: str) -> Decimal:
         raise ConfigError(f"{name} must be a plain decimal number, got {raw!r}.")
     try:
         value = Decimal(raw)
-    except InvalidOperation as exc:
+    except InvalidOperation as exc:  # pragma: no cover - regex already guards
         raise ConfigError(f"{name} must be a number, got {raw!r}.") from exc
-    if not value.is_finite():
-        raise ConfigError(f"{name} must be finite.")
     return value
 
 
@@ -258,7 +250,7 @@ def _int(env: Mapping[str, str], name: str, default: int) -> int:
     return int(raw)
 
 
-def _bool(env: Mapping[str, str], name: str, default: bool) -> bool:
+def bool_setting(env: Mapping[str, str], name: str, default: bool) -> bool:
     if name not in env:
         return default
     v = _optional(env, name, "").lower()

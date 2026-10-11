@@ -1,68 +1,66 @@
-"""Strict hostname allowlist for every outbound broker/data connection.
+"""Egress policy: the only network destinations this process may ever reach.
 
-This module is the single source of truth for which Alpaca hosts the lab may talk to.
-Anything not explicitly allowed is refused - including hosts we have never heard of.
+Trading Lab never connects to a brokerage. All trading is simulated in-process against
+market data. The egress policy makes that structural rather than a convention:
 
-Allowed:
-  * paper-api.alpaca.markets   - paper trading REST API (orders, positions, account, clock)
-  * data.alpaca.markets        - market data REST API (read-only; same host for all accounts)
-  * stream.data.alpaca.markets - market data websocket (read-only)
+  * DENY first: any host under a known brokerage / exchange-trading domain raises
+    BrokerageForbiddenError, even if someone adds it to the allowlist by mistake.
+  * ALLOW only: the market-data provider (api.tiingo.com), the Claude API
+    (api.anthropic.com), the configured PostgreSQL host, and loopback/private addresses.
+  * Everything else raises EgressDeniedError (fail closed), including hosts we have never
+    heard of and public IP literals (which cannot be checked against a hostname list).
 
-Explicitly denied (checked first, so a misconfigured allowlist can never let them through):
-  * api.alpaca.markets         - LIVE trading
-  * broker-api.alpaca.markets  - Broker API (live)
-  * any other *.alpaca.markets host not on the allowlist
+Hosts are IDNA-normalised exactly as the socket layer would before any check, so Unicode
+look-alikes, trailing dots, ports, case and zero-width characters cannot disguise a host.
 """
 
 from __future__ import annotations
 
+import ipaddress
+from collections.abc import Iterable
 from typing import Final
 from urllib.parse import urlsplit
 
-PAPER_TRADING_HOST: Final = "paper-api.alpaca.markets"
-PAPER_TRADING_URL: Final = f"https://{PAPER_TRADING_HOST}"
+DATA_PROVIDER_HOST: Final = "api.tiingo.com"
+DATA_PROVIDER_URL: Final = f"https://{DATA_PROVIDER_HOST}"
+RESEARCH_HOST: Final = "api.anthropic.com"
 
-MARKET_DATA_HOST: Final = "data.alpaca.markets"
-MARKET_DATA_STREAM_HOST: Final = "stream.data.alpaca.markets"
+DEFAULT_ALLOWED_HOSTS: Final[frozenset[str]] = frozenset({DATA_PROVIDER_HOST, RESEARCH_HOST})
 
-ALLOWED_TRADING_HOSTS: Final[frozenset[str]] = frozenset({PAPER_TRADING_HOST})
-ALLOWED_DATA_HOSTS: Final[frozenset[str]] = frozenset({MARKET_DATA_HOST, MARKET_DATA_STREAM_HOST})
-ALLOWED_ALPACA_HOSTS: Final[frozenset[str]] = ALLOWED_TRADING_HOSTS | ALLOWED_DATA_HOSTS
-
-# Hosts that can place real-money orders. Never reachable from this process.
-DENIED_LIVE_HOSTS: Final[frozenset[str]] = frozenset(
+# Domains of brokerages and trading venues with order-entry APIs. Matched as the domain
+# itself or any subdomain. This list exists for clear errors and defence in depth: the
+# allowlist above would already refuse them.
+BROKERAGE_DOMAINS: Final[frozenset[str]] = frozenset(
     {
-        "api.alpaca.markets",
-        "broker-api.alpaca.markets",
-        "live-api.alpaca.markets",
+        "alpaca.markets", "interactivebrokers.com", "interactivebrokers.ca", "ibkr.com",
+        "ibllc.com", "questrade.com", "wealthsimple.com", "tradier.com", "schwabapi.com",
+        "schwab.com", "tdameritrade.com", "etrade.com", "robinhood.com", "tastytrade.com",
+        "tastyworks.com", "tradestation.com", "webull.com", "moomoo.com", "futunn.com",
+        "oanda.com", "fxcm.com", "lime.co", "public.com", "firstrade.com", "ally.com",
+        "fidelity.com", "vanguard.com", "qtrade.ca", "td.com", "rbcdirectinvesting.com",
+        "bmoinvestorline.com", "cibc.com", "scotiaitrade.com", "nbdb.ca", "disnat.com",
+        "coinbase.com", "kraken.com", "binance.com", "binance.us", "gemini.com",
+        "bitstamp.net", "deribit.com", "bybit.com", "okx.com",
     }
 )
 
-ALPACA_DOMAIN_SUFFIX: Final = ".alpaca.markets"
+
+class BrokerageForbiddenError(RuntimeError):
+    """Raised whenever anything attempts to reach a brokerage or trading venue."""
 
 
-class LiveTradingForbiddenError(RuntimeError):
-    """Raised whenever anything attempts to reach a live (real-money) trading endpoint."""
-
-
-class EndpointNotAllowedError(RuntimeError):
-    """Raised for any broker/data URL that is not on the strict allowlist."""
+class EgressDeniedError(RuntimeError):
+    """Raised for any destination that is not on the egress allowlist."""
 
 
 def normalize_host(host: str) -> str:
-    """Canonical ASCII host: IDNA-encoded, lower-case, no whitespace, trailing dot, or port.
-
-    Non-ASCII hosts are converted the same way the socket layer converts them (IDNA), so
-    look-alikes such as 'api。alpaca。markets' (ideographic full stops) or an
-    appended zero-width space normalise to the real host they would resolve to. A non-ASCII
-    host that cannot be converted is refused outright (fail closed).
-    """
+    """Canonical ASCII host: IDNA-encoded, lower-case, no whitespace, trailing dot, or port."""
     h = host.strip()
     if not h.isascii():
         try:
             h = h.encode("idna").decode("ascii")
         except UnicodeError as exc:
-            raise EndpointNotAllowedError("Unconvertible non-ASCII hostname refused.") from exc
+            raise EgressDeniedError("Unconvertible non-ASCII hostname refused.") from exc
     h = h.lower()
     if h.startswith("[") and "]" in h:  # IPv6 literal
         return h[1 : h.index("]")]
@@ -71,64 +69,79 @@ def normalize_host(host: str) -> str:
     return h.rstrip(".")
 
 
-def is_live_host(host: str) -> bool:
+def is_brokerage_host(host: str) -> bool:
     h = normalize_host(host)
-    return h in DENIED_LIVE_HOSTS
+    return any(h == d or h.endswith("." + d) for d in BROKERAGE_DOMAINS)
 
 
-def is_alpaca_host(host: str) -> bool:
-    h = normalize_host(host)
-    return h == ALPACA_DOMAIN_SUFFIX[1:] or h.endswith(ALPACA_DOMAIN_SUFFIX)
+def _ip(host: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(host)
+    except ValueError:
+        return None
 
 
-def check_alpaca_host(host: str) -> str:
-    """Return the normalized host if it is an allowed Alpaca host; raise otherwise.
+class EgressPolicy:
+    """Hostname allowlist. Hosts can be added until `freeze()`; the denylist always wins."""
 
-    Live hosts raise LiveTradingForbiddenError. Unknown *.alpaca.markets hosts raise
-    EndpointNotAllowedError (fail closed: Alpaca could add a new live hostname).
-    """
-    h = normalize_host(host)
-    if h in DENIED_LIVE_HOSTS:
-        raise LiveTradingForbiddenError(f"Refusing to connect to live trading host {h!r}.")
-    if h not in ALLOWED_ALPACA_HOSTS:
-        raise EndpointNotAllowedError(f"Host {h!r} is not on the paper-only allowlist.")
-    return h
+    def __init__(self, allowed: Iterable[str] = DEFAULT_ALLOWED_HOSTS) -> None:
+        self._allowed: set[str] = set()
+        self._frozen = False
+        self.allow(allowed)
 
+    def allow(self, hosts: Iterable[str]) -> None:
+        normalized = [normalize_host(h) for h in hosts]
+        for h in normalized:
+            if is_brokerage_host(h):
+                raise BrokerageForbiddenError(f"Refusing to allow brokerage host {h!r}.")
+        new = set(normalized) - self._allowed
+        if new and self._frozen:
+            raise EgressDeniedError("Egress policy is frozen; refusing to widen it.")
+        self._allowed |= new
 
-def validate_trading_url(url: str) -> str:
-    """Validate a trading base URL. Only https://paper-api.alpaca.markets is accepted."""
-    host = _validated_https_host(url)
-    if host in DENIED_LIVE_HOSTS:
-        raise LiveTradingForbiddenError(f"Refusing live trading URL {url!r}.")
-    if host not in ALLOWED_TRADING_HOSTS:
-        raise EndpointNotAllowedError(
-            f"Trading URL {url!r} is not allowed. Only {PAPER_TRADING_URL} is permitted."
-        )
-    return f"https://{host}"
+    def freeze(self) -> None:
+        self._frozen = True
 
+    @property
+    def frozen(self) -> bool:
+        return self._frozen
 
-def validate_data_url(url: str) -> str:
-    host = _validated_https_host(url, schemes=("https", "wss"))
-    check_alpaca_host(host)
-    if host not in ALLOWED_DATA_HOSTS:
-        raise EndpointNotAllowedError(f"Data URL {url!r} is not an allowed market-data host.")
-    return host
+    @property
+    def allowed_hosts(self) -> frozenset[str]:
+        return frozenset(self._allowed)
 
+    def check(self, host: str) -> str:
+        """Return the normalised host if allowed; raise otherwise."""
+        h = normalize_host(host)
+        if not h:
+            raise EgressDeniedError("Empty host.")
+        if is_brokerage_host(h):
+            raise BrokerageForbiddenError(f"Refusing to connect to brokerage host {h!r}.")
+        if h == "localhost" or h.endswith(".localhost"):
+            return h
+        ip = _ip(h)
+        if ip is not None:
+            if ip.is_loopback or ip.is_private or ip.is_link_local:
+                return h
+            raise EgressDeniedError(f"Public IP literal {h!r} cannot be verified; refused.")
+        if h in self._allowed:
+            return h
+        raise EgressDeniedError(f"Host {h!r} is not on the egress allowlist.")
 
-def _validated_https_host(url: str, schemes: tuple[str, ...] = ("https",)) -> str:
-    if not isinstance(url, str) or not url.strip():
-        raise EndpointNotAllowedError("Empty or non-string URL.")
-    parts = urlsplit(url.strip())
-    if parts.scheme.lower() not in schemes:
-        raise EndpointNotAllowedError(f"URL {url!r} must use one of {schemes}.")
-    if not parts.hostname:
-        raise EndpointNotAllowedError(f"URL {url!r} has no host.")
-    # Classify live hosts first so the louder error is raised even for disguised URLs
-    # such as https://paper-api.alpaca.markets@api.alpaca.markets.
-    if normalize_host(parts.hostname) in DENIED_LIVE_HOSTS:
-        raise LiveTradingForbiddenError(f"Refusing live trading URL {url!r}.")
-    if parts.username or parts.password:
-        raise EndpointNotAllowedError("Credentials embedded in URLs are not allowed.")
-    if parts.port not in (None, 443):
-        raise EndpointNotAllowedError(f"URL {url!r} uses a non-standard port.")
-    return normalize_host(parts.hostname)
+    def check_url(self, url: str) -> str:
+        """Validate an https URL against the policy. Returns the normalised host."""
+        if not isinstance(url, str) or not url.strip():
+            raise EgressDeniedError("Empty or non-string URL.")
+        parts = urlsplit(url.strip())
+        if not parts.hostname:
+            raise EgressDeniedError(f"URL {url!r} has no host.")
+        host = normalize_host(parts.hostname)
+        if is_brokerage_host(host):  # loudest error first, even for disguised URLs
+            raise BrokerageForbiddenError(f"Refusing brokerage URL {url!r}.")
+        if parts.scheme.lower() != "https":
+            raise EgressDeniedError(f"URL {url!r} must use https.")
+        if parts.username or parts.password:
+            raise EgressDeniedError("Credentials embedded in URLs are not allowed.")
+        if parts.port not in (None, 443):
+            raise EgressDeniedError(f"URL {url!r} uses a non-standard port.")
+        return self.check(host)

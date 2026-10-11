@@ -86,7 +86,7 @@ class SessionTimeTests(unittest.TestCase):
             session(date(2026, 12, 25))
 
     def test_ny_date(self):
-        # Alpaca daily bars are stamped at midnight New York time.
+        # A timestamp is mapped to its New York session date.
         self.assertEqual(ny_date(datetime(2026, 10, 9, 4, 0, tzinfo=UTC)), date(2026, 10, 9))
         self.assertEqual(ny_date(datetime(2026, 1, 9, 5, 0, tzinfo=UTC)), date(2026, 1, 9))
         with self.assertRaises(ValueError):

@@ -1,164 +1,121 @@
+import copy
+import pickle
 import unittest
 from decimal import Decimal
 
-from tests.helpers import FAKE_PAPER_KEY, FAKE_SECRET, valid_env
+from tests.helpers import FAKE_TIINGO_TOKEN, valid_env
 from tradinglab.config import ConfigError, RiskLimits, Settings, load_settings
-from tradinglab.config import Secret
 
 
 class LoadSettingsTests(unittest.TestCase):
     def test_valid_defaults(self):
         s = load_settings(valid_env())
-        self.assertEqual(s.trading_mode, "paper")
-        self.assertEqual(s.trading_base_url, "https://paper-api.alpaca.markets")
-        self.assertFalse(s.order_submission_enabled, "order submission must default OFF")
+        self.assertEqual(s.trading_mode, "simulated")
         self.assertEqual(s.capital_base_usd, Decimal("10000"))
         self.assertEqual(s.symbols, ("SPY", "QQQ", "IWM"))
         self.assertEqual(s.risk.risk_per_trade_pct, Decimal("0.005"))
         self.assertEqual(s.risk.max_exposure_pct, Decimal("0.30"))
         self.assertEqual(s.risk.max_open_positions, 3)
+        self.assertEqual(s.egress_hosts, frozenset({"api.tiingo.com", "api.anthropic.com"}))
+        self.assertIsNone(s.data_token)
 
-    def test_trading_mode_must_be_exactly_paper(self):
-        for mode in ("live", "Paper", "PAPER", " paper", "paper ", "", "both", "real"):
+    def test_trading_mode_must_be_exactly_simulated(self):
+        for mode in ("live", "paper", "Simulated", " simulated", "simulated ", "", "real"):
             with self.subTest(mode=mode), self.assertRaises(ConfigError):
                 load_settings(valid_env(TRADING_MODE=mode))
 
     def test_missing_required(self):
-        for name in ("APP_ENV", "TRADING_MODE", "ALPACA_PAPER_API_KEY", "ALPACA_PAPER_SECRET_KEY"):
+        for name in ("APP_ENV", "TRADING_MODE"):
             env = valid_env()
             del env[name]
             with self.subTest(missing=name), self.assertRaises(ConfigError):
                 load_settings(env)
 
-    def test_ambiguous_env_vars_fail_closed(self):
-        for name in (
-            "APCA_API_KEY_ID",
-            "APCA_API_SECRET_KEY",
-            "APCA_API_BASE_URL",
-            "ALPACA_API_KEY",
-            "ALPACA_BASE_URL",
-        ):
+    def test_brokerage_variables_refused(self):
+        for name in ("ALPACA_API_KEY", "APCA_API_KEY_ID", "IBKR_ACCOUNT", "IB_GATEWAY_HOST",
+                     "QUESTRADE_REFRESH_TOKEN", "WEALTHSIMPLE_PASSWORD", "TRADIER_TOKEN",
+                     "SCHWAB_APP_KEY", "BROKER_URL", "MY_BROKER_KEY", "LIVE_TRADING",
+                     "alpaca_secret"):
             with self.subTest(var=name), self.assertRaises(ConfigError):
                 load_settings(valid_env(**{name: "x"}))
 
-    def test_paper_base_url_in_apca_var_is_still_ambiguous(self):
+    def test_tiingo_token(self):
+        s = load_settings(valid_env(TIINGO_API_TOKEN=FAKE_TIINGO_TOKEN))
+        self.assertEqual(s.require_data_token().get(), FAKE_TIINGO_TOKEN)
+        for bad in ("short", "has spaces in it 0000000000", "x" * 70):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                load_settings(valid_env(TIINGO_API_TOKEN=bad))
         with self.assertRaises(ConfigError):
-            load_settings(valid_env(APCA_API_BASE_URL="https://paper-api.alpaca.markets"))
+            load_settings(valid_env()).require_data_token()
 
-    def test_live_named_vars_rejected(self):
-        for name in ("ALPACA_LIVE_API_KEY", "LIVE_ALPACA_SECRET", "APCA_LIVE_URL"):
-            with self.subTest(var=name), self.assertRaises(ConfigError):
-                load_settings(valid_env(**{name: "x"}))
-
-    def test_live_looking_key_rejected(self):
-        with self.assertRaises(ConfigError) as ctx:
-            load_settings(valid_env(ALPACA_PAPER_API_KEY="AKLIVEKEY00000000000"))
-        self.assertIn("LIVE", str(ctx.exception))
-
-    def test_unknown_key_prefix_rejected(self):
+    def test_anthropic_key_format(self):
+        load_settings(valid_env(ANTHROPIC_API_KEY="sk-ant-" + "a" * 40))
         with self.assertRaises(ConfigError):
-            load_settings(valid_env(ALPACA_PAPER_API_KEY="XXSOMETHING000000000"))
+            load_settings(valid_env(ANTHROPIC_API_KEY="not-a-key"))
 
-    def test_malformed_secrets(self):
-        with self.assertRaises(ConfigError):
-            load_settings(valid_env(ALPACA_PAPER_SECRET_KEY="short"))
-        with self.assertRaises(ConfigError):
-            load_settings(valid_env(ALPACA_PAPER_API_KEY="PK bad key 000000000"))
+    def test_database_host_added_to_egress(self):
+        s = load_settings(valid_env(
+            DATABASE_URL="postgresql://u:p@postgres.railway.internal:5432/railway"))
+        self.assertIn("postgres.railway.internal", s.egress_hosts)
+        for bad in ("mysql://x@h/db", "postgresql:///nohost"):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                load_settings(valid_env(DATABASE_URL=bad))
 
-    def test_order_submission_flag_parsing(self):
-        self.assertTrue(load_settings(valid_env(ORDER_SUBMISSION_ENABLED="true")).order_submission_enabled)
-        self.assertFalse(load_settings(valid_env(ORDER_SUBMISSION_ENABLED="false")).order_submission_enabled)
+    def test_database_url_cannot_point_at_brokerage(self):
         with self.assertRaises(ConfigError):
-            load_settings(valid_env(ORDER_SUBMISSION_ENABLED="maybe"))
+            load_settings(valid_env(DATABASE_URL="postgresql://u:p@db.alpaca.markets/x"))
+
+    def test_any_proxy_variable_refused(self):
+        for var in ("HTTPS_PROXY", "http_proxy", "ALL_PROXY", "WSS_PROXY"):
+            with self.subTest(var=var), self.assertRaises(ConfigError):
+                load_settings(valid_env(**{var: "http://p:3128"}))
+        load_settings(valid_env(NO_PROXY="localhost"))
 
     def test_risk_hard_ceilings(self):
-        bad = {
-            "RISK_PER_TRADE_PCT": "0.05",
-            "MAX_PORTFOLIO_EXPOSURE_PCT": "1.5",  # leverage
-            "MAX_OPEN_POSITIONS": "50",
-            "INTRADAY_LOSS_HALT_PCT": "0.5",
-            "PEAK_DRAWDOWN_HALT_PCT": "0.9",
-        }
+        bad = {"RISK_PER_TRADE_PCT": "0.05", "MAX_PORTFOLIO_EXPOSURE_PCT": "1.5",
+               "MAX_OPEN_POSITIONS": "50", "INTRADAY_LOSS_HALT_PCT": "0.5",
+               "PEAK_DRAWDOWN_HALT_PCT": "0.9"}
         for name, value in bad.items():
             with self.subTest(name=name), self.assertRaises(ConfigError):
                 load_settings(valid_env(**{name: value}))
-        for name in ("RISK_PER_TRADE_PCT", "MAX_PORTFOLIO_EXPOSURE_PCT"):
-            for value in ("0", "-0.1", "nan", "abc"):
-                with self.subTest(name=name, value=value), self.assertRaises(ConfigError):
-                    load_settings(valid_env(**{name: value}))
-
-    def test_symbols_validation(self):
-        with self.assertRaises(ConfigError):
-            load_settings(valid_env(SYMBOLS="SPY,spy"))
-        with self.assertRaises(ConfigError):
-            load_settings(valid_env(SYMBOLS="SPY,BRK.B"))
-        self.assertEqual(load_settings(valid_env(SYMBOLS="spy, qqq")).symbols, ("SPY", "QQQ"))
-
-
-class StrictParsingTests(unittest.TestCase):
-    def test_padded_or_empty_values_rejected_not_trimmed(self):
-        for name, value in (("APP_ENV", " test"), ("ALPACA_PAPER_API_KEY", "PKTESTFAKE0000000000 "),
-                            ("RISK_PER_TRADE_PCT", ""), ("ORDER_SUBMISSION_ENABLED", ""),
-                            ("SYMBOLS", " SPY"), ("MAX_OPEN_POSITIONS", " 3")):
-            with self.subTest(name=name, value=value), self.assertRaises(ConfigError):
-                load_settings(valid_env(**{name: value}))
-
-    def test_app_env_exact_lowercase(self):
-        with self.assertRaises(ConfigError):
-            load_settings(valid_env(APP_ENV="Production"))
-
-    def test_numeric_formats(self):
-        for name, value in (("MAX_OPEN_POSITIONS", "1_0"), ("MAX_OPEN_POSITIONS", "2.0"),
-                            ("RISK_PER_TRADE_PCT", "5e-3"), ("RISK_PER_TRADE_PCT", "0.005%")):
+        for value in ("0", "-0.1", "nan", "abc", "5e-3", "1_0"):
             with self.subTest(value=value), self.assertRaises(ConfigError):
+                load_settings(valid_env(RISK_PER_TRADE_PCT=value))
+
+    def test_padded_or_empty_values_rejected(self):
+        for name, value in (("APP_ENV", " test"), ("RISK_PER_TRADE_PCT", ""),
+                            ("SYMBOLS", " SPY"), ("MAX_OPEN_POSITIONS", " 3"),
+                            ("TIINGO_API_TOKEN", "")):
+            with self.subTest(name=name), self.assertRaises(ConfigError):
                 load_settings(valid_env(**{name: value}))
 
-    def test_any_proxy_variable_refused_in_every_env(self):
-        for app_env in ("test", "development", "production"):
-            for var in ("HTTPS_PROXY", "http_proxy", "ALL_PROXY", "WSS_PROXY", "ftp_proxy"):
-                with self.subTest(env=app_env, var=var), self.assertRaises(ConfigError):
-                    load_settings(valid_env(APP_ENV=app_env, **{var: "http://p:3128"}))
-        load_settings(valid_env(NO_PROXY="localhost"))  # NO_PROXY is harmless
+    def test_symbols(self):
+        self.assertEqual(load_settings(valid_env(SYMBOLS="spy, qqq")).symbols, ("SPY", "QQQ"))
+        for bad in ("SPY,spy", "SPY,BRK.B"):
+            with self.subTest(bad=bad), self.assertRaises(ConfigError):
+                load_settings(valid_env(SYMBOLS=bad))
 
-
-class SecretHandlingTests(unittest.TestCase):
-    def test_secret_cannot_be_pickled_or_copied(self):
-        import copy
-        import pickle
-
-        s = load_settings(valid_env())
-        with self.assertRaises(TypeError):
-            pickle.dumps(s.alpaca_secret_key)
-        with self.assertRaises(TypeError):
-            copy.deepcopy(s.alpaca_api_key)
-
-    def test_secrets_never_in_repr_or_str(self):
-        s = load_settings(valid_env())
-        for text in (repr(s), str(s), f"{s}", repr(s.alpaca_api_key), f"{s.alpaca_secret_key}"):
-            self.assertNotIn(FAKE_PAPER_KEY, text)
-            self.assertNotIn(FAKE_SECRET, text)
-
-    def test_config_error_does_not_echo_secret(self):
-        with self.assertRaises(ConfigError) as ctx:
-            load_settings(valid_env(ALPACA_PAPER_API_KEY="AKLIVEKEY00000000000"))
-        self.assertNotIn("AKLIVEKEY00000000000", str(ctx.exception))
-
-
-class SettingsConstructionTests(unittest.TestCase):
-    def test_cannot_hand_build_live_settings(self):
-        common = dict(
-            app_env="test",
-            alpaca_api_key=Secret(FAKE_PAPER_KEY),
-            alpaca_secret_key=Secret(FAKE_SECRET),
-            order_submission_enabled=False,
-            capital_base_usd=Decimal("10000"),
-            symbols=("SPY",),
-            risk=RiskLimits(),
-        )
+    def test_cannot_hand_build_real_trading_settings(self):
         with self.assertRaises(ConfigError):
-            Settings(**common, trading_mode="live")
-        with self.assertRaises(Exception):
-            Settings(**common, trading_base_url="https://api.alpaca.markets")
+            Settings("test", Decimal(10000), ("SPY",), RiskLimits(), trading_mode="live")
+
+
+class SecretTests(unittest.TestCase):
+    def test_secrets_hidden_and_unpicklable(self):
+        s = load_settings(valid_env(TIINGO_API_TOKEN=FAKE_TIINGO_TOKEN,
+                                    DATABASE_URL="postgresql://u:hunter2@db.internal/x"))
+        for text in (repr(s), str(s), f"{s}", repr(s.data_token), f"{s.database_url}"):
+            self.assertNotIn(FAKE_TIINGO_TOKEN, text)
+            self.assertNotIn("hunter2", text)
+        with self.assertRaises(TypeError):
+            pickle.dumps(s.data_token)
+        with self.assertRaises(TypeError):
+            copy.deepcopy(s.database_url)
+
+    def test_errors_do_not_echo_secret(self):
+        with self.assertRaises(ConfigError) as ctx:
+            load_settings(valid_env(TIINGO_API_TOKEN="bad token value 1234567890"))
+        self.assertNotIn("bad token value", str(ctx.exception))
 
 
 if __name__ == "__main__":

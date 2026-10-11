@@ -1,6 +1,6 @@
 """Research command line.
 
-    python -m tradinglab.research.cli fetch    --out data/cache
+    python -m tradinglab.research.cli fetch    --out data/cache     # needs TIINGO_API_TOKEN
     python -m tradinglab.research.cli baseline --data data/cache
     python -m tradinglab.research.cli baseline --synthetic          # offline demo only
 
@@ -22,7 +22,7 @@ import sys
 from datetime import UTC, date, datetime
 from pathlib import Path
 
-from tradinglab.marketdata.bars import BarSeries, DatasetMeta, file_sha256, load_series, save_series
+from tradinglab.marketdata.bars import BarSeries, file_sha256, load_series, save_series
 from tradinglab.research.backtest import BacktestConfig, Backtester
 from tradinglab.research.metrics import (
     attribution,
@@ -66,12 +66,16 @@ def load_dotenv_if_present(path: Path = Path(".env")) -> None:
 def cmd_fetch(args: argparse.Namespace) -> int:
     load_dotenv_if_present()
     from tradinglab.config import load_settings
-    from tradinglab.marketdata.alpaca_data import AlpacaDailyBars
+    from tradinglab.marketdata.calendar import last_completed_session
+    from tradinglab.marketdata.tiingo import TiingoClient
+    from tradinglab.safety.network_guard import install_network_guard
 
     settings = load_settings(os.environ)
-    src = AlpacaDailyBars(settings, feed=args.feed, adjustment=args.adjustment)
-    end = date.fromisoformat(args.end) if args.end else datetime.now(UTC).date()
-    series, metas = src.fetch(list(settings.symbols), date.fromisoformat(args.start), end)
+    install_network_guard(settings.egress_hosts)
+    client = TiingoClient(settings.require_data_token())
+    latest = last_completed_session(datetime.now(UTC), settle_minutes=270)
+    end = min(date.fromisoformat(args.end), latest) if args.end else latest
+    series, metas = client.history(list(settings.symbols), date.fromisoformat(args.start), end)
     out = Path(args.out)
     for sym, s in series.items():
         p = save_series(s, out, metas[sym])
@@ -88,7 +92,7 @@ def _load_data(args: argparse.Namespace) -> tuple[dict[str, BarSeries], dict, bo
         return data, {"source": "SYNTHETIC (not market data)"}, True
     data, fingerprints = {}, {}
     for sym in DEFAULT_SYMBOLS:
-        path = Path(args.data) / f"{sym}_{args.feed}_{args.adjustment}.csv"
+        path = Path(args.data) / f"{sym}_eod_raw.csv"
         if not path.exists():
             raise SystemExit(f"missing {path}; run the fetch command first")
         s, meta = load_series(path)
@@ -192,8 +196,8 @@ Parameter stability: {wf.param_stability:.0%} of segments chose the same paramet
 
 ## Caveats
 
-- Split-adjusted prices; dividends excluded (Alpaca paper does not credit them), so returns
-  understate buy-and-hold ETF total return by roughly the dividend yield.
+- Fills use raw traded prices; cash dividends are credited on ex-dates (not reinvested) and
+  splits rescale positions. Benchmarks are price-only buy-and-hold plus the same dividends.
 - The 3% intraday halt is checked on closing equity in backtests (no intraday path in daily bars).
 - Exposure cap applies when sizing; positions may drift slightly above 30% as prices move.
 - A good backtest is not evidence of future profitability. Forward paper results decide.
@@ -217,20 +221,16 @@ Parameter stability: {wf.param_stability:.0%} of segments chose the same paramet
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="tradinglab.research")
     sub = p.add_subparsers(dest="cmd", required=True)
-    f = sub.add_parser("fetch", help="download daily bars from Alpaca (needs paper keys)")
+    f = sub.add_parser("fetch", help="download daily bars from Tiingo (needs TIINGO_API_TOKEN)")
     f.add_argument("--start", default="2016-01-01")
     f.add_argument("--end")
     f.add_argument("--out", default="data/cache")
-    f.add_argument("--feed", default="sip", choices=["sip", "iex"])
-    f.add_argument("--adjustment", default="split", choices=["raw", "split", "all"])
     f.set_defaults(func=cmd_fetch)
 
     b = sub.add_parser("baseline", help="run the no-leakage baseline study")
     g = b.add_mutually_exclusive_group(required=True)
     g.add_argument("--data")
     g.add_argument("--synthetic", action="store_true")
-    b.add_argument("--feed", default="sip")
-    b.add_argument("--adjustment", default="split")
     b.add_argument("--reports", default="reports")
     b.add_argument("--final-test", action="store_true")
     b.add_argument("--reason")

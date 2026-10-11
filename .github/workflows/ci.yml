@@ -24,13 +24,13 @@ jobs:
           pip install -e ".[dev]"
       - name: Lint
         run: ruff check src tests
-      - name: Tests (including live-trading-impossible proofs)
+      - name: Tests (including no-real-trading proofs)
         env:
-          # No real credentials in CI: the suite uses obviously fake paper-format keys.
+          # No real credentials in CI: the suite uses obviously fake tokens and no network.
           PYTHONHASHSEED: "0"
         run: pytest
       - name: Refuse committed secrets
         run: |
           if git ls-files | grep -E '(^|/)\.env$'; then echo ".env committed"; exit 1; fi
-          if git grep -nE '\b(AK|PK)[A-Z0-9]{16,}\b' -- ':!tests/*'; then
-            echo "possible Alpaca key in repo"; exit 1; fi
+          if git grep -nE 'sk-ant-[A-Za-z0-9_-]{20,}|\b[0-9a-f]{40}\b' -- ':!tests/*'; then
+            echo "possible API key in repo"; exit 1; fi

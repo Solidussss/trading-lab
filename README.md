@@ -1,65 +1,81 @@
 # Trading Lab
 
-Private, autonomous, **paper-only** quantitative trading research system for SPY, QQQ and
-IWM, built on the Alpaca paper trading API. No real-money trading code exists in this repo.
+Private, autonomous, **simulation-only** quantitative trading research system for SPY, QQQ
+and IWM. It runs its own virtual portfolio against daily market data from Tiingo. There is
+no brokerage connection and no real-money trading code; see `docs/SAFETY.md`.
 
 ## Status
 
 | Phase | Scope | State |
 |---|---|---|
-| 1 | Project structure, fail-closed config, paper-only safety layers, broker adapter, order gate, risk rules | ✅ done, tested |
-| 2 | NYSE calendar, data layer + cache, trend following v1, backtester, costs, splits, walk-forward, test vault, metrics, reports | ✅ done, tested on synthetic data; real-data run needs paper keys |
-| 3 | Deterministic paper engine (evaluate after close, OPG orders, resting stops, reconciliation) | next |
-| 4 | PostgreSQL schema + decision/order/fill logging | |
-| 5 | Railway scheduled jobs + restart/recovery | |
+| 1 | Project structure, fail-closed config, egress allowlist, network guard, self-check | ✅ done, tested |
+| 2 | NYSE calendar, data layer + checksummed cache, trend following v1, backtester, costs, splits, walk-forward, test vault, metrics, reports | ✅ done, tested on synthetic data |
+| 3 | Simulation core shared by backtests and live engine; live engine with catch-up, idempotency, data waits, atomic commits, pause, manual drawdown resume; Tiingo client | ✅ done, tested (incl. exact live/backtest parity) |
+| 4 | PostgreSQL store (same interface as the in-memory store) + migrations | next |
+| 5 | Railway: dashboard/API service + nightly job, restart/recovery, monitoring | |
 | 6 | Authenticated mobile dashboard | |
 | 7 | Momentum and mean-reversion strategies | |
 | 8 | Claude research reports (scheduled / on demand only) | |
 
-Order submission is **off** (`ORDER_SUBMISSION_ENABLED=false`) and stays off until the
-activation checklist in `docs/SAFETY.md` passes and you approve.
+## Architecture
+
+```
+Tiingo EOD API ──► marketdata/tiingo.py ──► BarSource
+                                              │
+                    engine/live.py  ◄─────────┘   nightly job: process each new session
+                         │
+                         ▼
+                    sim/core.py  ◄── research/backtest.py (same code path for research)
+              (orders, fills, stops, dividends, splits, risk, halts, decisions)
+                         │
+                         ▼
+                    engine/store.py  (in-memory now; PostgreSQL in Phase 4)
+                         │
+                         ▼
+                 dashboard / Claude research (Phases 6, 8)
+```
+
+- **Virtual portfolio:** `$10,000` starting capital, long-only, no leverage, whole shares.
+- **Execution model:** signal after close(D); on-open limit order at close × 1.01; resting
+  protective stop. Fills use D+1's real open/low with conservative costs.
+- **Modular:** `broker/base.py` documents the interface a brokerage adapter would need, but
+  none exists and the safety layer forbids one in V1.
 
 ## Quick start (local)
 
 ```bash
 python3.12 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env        # add your Alpaca PAPER keys (never commit .env)
+cp .env.example .env          # add TIINGO_API_TOKEN (never commit .env)
 
-pytest                                        # full suite, no network or keys needed
-pytest tests/test_live_trading_impossible.py -v
+pytest                                           # full suite, no network or keys needed
+pytest tests/test_no_real_trading.py -v
 
 python -m tradinglab.research.cli baseline --synthetic   # offline pipeline demo
-python -m tradinglab.research.cli fetch                  # real SIP daily bars (paper keys)
+python -m tradinglab.research.cli fetch                  # real daily bars from Tiingo
 python -m tradinglab.research.cli baseline --data data/cache
 ```
-
-Reports are written to `reports/` as Markdown and JSON.
 
 ## Layout
 
 ```
 src/tradinglab/
-  config.py               fail-closed settings, Secret wrapper, hard risk ceilings
-  safety/                 endpoint allowlist, network guard, order gate, startup self-check
-  broker/                 Broker protocol, Alpaca paper adapter, deterministic fake broker
-  marketdata/             NYSE calendar, bar validation + checksummed cache, Alpaca fetcher
-  strategies/             strategy interface, indicators, trend following v1
-  engine/risk.py          position sizing and halts (shared by backtest and live engine)
-  research/               backtester, costs, metrics, splits/walk-forward/test vault, CLI
-tests/                    unittest-style tests, runnable with pytest or `python -m unittest`
-docs/                     SAFETY.md, DATA.md, RESEARCH.md
+  config.py           fail-closed settings, Secret wrapper, hard risk ceilings
+  safety/             egress allowlist, network guard, startup self-check
+  marketdata/         NYSE calendar, bars (+dividends/splits), cache, Tiingo client
+  strategies/         strategy interface, indicators, trend following v1
+  engine/risk.py      position sizing and halts
+  sim/core.py         the simulation core (one session at a time, serialisable state)
+  engine/live.py      live paper simulation driver; engine/store.py persistence interface
+  research/           backtester, costs, metrics, splits/walk-forward/test vault, CLI
+  broker/base.py      future brokerage interface (documentation only)
+tests/                unittest-style; run with pytest or `python -m unittest`
+docs/                 SAFETY.md, DATA.md, RESEARCH.md
 ```
 
-## Key documents
+## Notes
 
-- `docs/SAFETY.md` — the seven layers that make live trading impossible, and their limits
-- `docs/DATA.md` — Alpaca free-plan coverage, delays, limits, and how they shape the design
-- `docs/RESEARCH.md` — fill model, costs, risk rules, no-leakage protocol
-
-## Development notes
-
-- Target runtime: Python 3.12. Core engine and tests use only the standard library, so the
-  safety and research suites run without third-party packages.
-- Secrets live only in environment variables (Railway service variables in production).
-  `Secret` values never appear in `repr`, logs or error messages.
+- Python 3.12. The engine, simulator, safety layer and data client use only the standard
+  library, so the whole core runs and tests without third-party packages.
+- Results are in USD. A Canadian account trading these ETFs would also pay currency
+  conversion costs, which are not modelled.

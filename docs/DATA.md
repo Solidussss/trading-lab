@@ -1,53 +1,50 @@
-# Market data: Alpaca free (Basic) plan and its consequences
+# Market data: provider choice and its consequences
 
-Verified against Alpaca's documentation on 2026-10-10. Re-verify before relying on it.
+Checked 2026-10-10. Re-verify pricing and terms before relying on them.
 
-| Item | Basic (free) | Effect on this lab |
-|---|---|---|
-| Real-time equities | IEX exchange only | IEX is roughly 2% of consolidated volume (Alpaca's own AAPL example: 0.92M vs 51.9M shares on one day). IEX-only bars are **not** used for signals. |
-| Historical SIP (all exchanges) | Allowed if the request's `end` is at least 15 minutes old | Daily bars evaluated after the close can use full consolidated data for free. The fetcher clamps `end` to now − 16 min. |
-| Latest-quote / snapshot SIP endpoints | Require a subscription | Not used. Live sizing uses the last completed daily close, not a real-time quote. |
-| History depth | Since 2016 | Backtests start 2016; 2016 is reserved for indicator warm-up, research begins 2017-01-03. Roughly nine years: one major crash (2020), one bear market (2022). |
-| Historical API rate limit | 200 calls / minute | Three symbols of daily bars is a handful of calls. Client-side limiter caps at 150/min for headroom. |
-| WebSocket | 30 symbols, IEX | Not needed for a daily strategy. |
+## Choice: Tiingo (free plan)
 
-## Why daily bars
+| Need | Tiingo free plan |
+|---|---|
+| SPY, QQQ, IWM daily bars from 2016 | Yes: 30+ years of EOD history, ETFs included |
+| Raw prices + corporate actions | Raw OHLCV plus `divCash` and `splitFactor` per day (also CRSP-adjusted fields) |
+| Daily update | US EOD published ~5:30 pm ET; corrections until ~8 pm ET |
+| Limits | 50 requests/hour, 1,000/day, 500 unique symbols/month. The engine uses 3 requests/day |
+| Licence | Individual plans are "internal use only": personal use, not displayed or shared with others. A private single-user dashboard fits |
+| Canada | No country restriction stated |
+| Cost | $0 (Power plan $30/month if limits ever matter) |
 
-With IEX-only real-time data, intraday signals would be built from ~2% of the tape and could
-diverge from the consolidated price. Daily SIP bars, read 20 minutes after the close, are
-complete and free. V1 therefore evaluates once per day after the close.
+**Open item:** the full Tiingo Terms of Use page could not be loaded during research
+(pricing and documentation pages were). Read it when creating the account. If it conflicts
+with storing data in your own database, switch to Twelve Data's Grow plan ($29/month),
+whose terms explicitly allow storing data for internal use; only `marketdata/` changes.
 
-## Execution timing (live paper engine, Phase 3)
+### Alternatives considered
 
-1. **After close (D + 20 min):** fetch final SIP daily bars, evaluate strategies, size entries
-   from close(D), write decisions and pending order intents to the database.
-2. **Next morning (D+1, ~09:00 ET):** re-check pause, halts, calendar (rules vs Alpaca
-   `/v2/calendar` must agree), and existing orders; submit **on-open (OPG) limit** orders at
-   close(D) × 1.01. Positions are sized as if filled at that limit, so a gap up can never push
-   risk or exposure past the limits; an open above the limit simply does not fill. This is
-   exactly what the backtest models.
-3. **After the entry fills:** place a resting GTC **stop** order at the strategy's stop.
-   Trailing-stop updates replace that order after each close. This matches the backtest's
-   intraday stop model.
+| Provider | Why not chosen |
+|---|---|
+| Twelve Data | Free tier is "internal non-display" only; Grow plan $29/month for dashboard use. Good fallback. |
+| Massive (formerly Polygon) | Consolidated-tape quality, but 2016 history needs $79/month+, and its market-data terms restrict non-display use. |
+| EODHD | $19.99/month; prices are aggregated from non-exchange sources (its own disclaimer). |
+| Alpha Vantage | Adjusted full history is premium ($49.99/month). |
+| FMP | Terms forbid downloading/copying content without written approval. |
+| Marketstack | Free tier 100 requests/month and 1 year of history. |
+| Yahoo Finance / yfinance | Terms prohibit automated access; frequent rate-limit bans. |
+| Stooq | Unofficial; API-key change and outages in 2026; terms unreadable. |
+| Alpaca data | Market-data subscriptions currently unavailable to Canadian residents. |
 
-## How data limits affect results
+## How the engine uses the data
 
-- **Backtests vs paper fills:** paper fills match against the NBBO, and Alpaca randomly
-  partially fills ~10% of eligible orders. The paper broker does not model market impact,
-  queue position, latency slippage, or dividends. Backtests assume worse-than-real costs.
-- **Dividends:** the paper account does not credit dividends, so research uses
-  split-adjusted (not dividend-adjusted) prices for both the strategy and its benchmarks.
-- **Missing data:** every series is checked against the NYSE calendar. Missing sessions,
-  duplicates and impossible OHLC rows are reported and never silently filled. On a live
-  session with a missing or stale bar, the engine records a `stale_data` no-trade decision.
-- **Revisions:** downloaded data is cached with a SHA-256 checksum and fetch metadata, and
-  each report records the checksums it used, so results are reproducible even if Alpaca later
-  revises history.
-- **Paper account size:** new Alpaca paper accounts default to $100,000. Create a paper
-  account with a $10,000 balance (the balance is chosen at creation). The engine also sizes
-  against `CAPITAL_BASE_USD` regardless of the broker balance.
-
-Sources: [About Market Data API](https://docs.alpaca.markets/docs/about-market-data-api),
-[Market Data FAQ](https://docs.alpaca.markets/us/docs/market-data-faq),
-[Paper Trading](https://docs.alpaca.markets/docs/paper-trading),
-[TradingClient reference](https://alpaca.markets/sdks/python/api_reference/trading/trading-client.html).
+- **Once per evening** (after the corrections window): fetch ~500 days of daily bars for
+  each symbol (3 requests), then process every completed session since the last run.
+- **Fills use raw prices.** Orders decided at close(D) fill at open(D+1), using the real
+  open/high/low of D+1 — so they are settled in the evening run after D+1.
+- **Corporate actions are explicit.** Cash dividends are credited on ex-dates to positions
+  held at the prior close; splits rescale positions. Strategies see a split-adjusted view.
+- **Missing data:** if a session's bar is missing, the engine waits; after two sessions it
+  proceeds and records a data gap (e.g. an unscheduled closure). Bars on days the NYSE
+  calendar marks closed are flagged and ignored. Every session stores the exact bars used.
+- **Revisions:** fills are final once processed (as in real trading). Research datasets are
+  cached with SHA-256 checksums so backtests are reproducible.
+- **Intraday prices:** not used by the V1 strategy. Tiingo's free IEX endpoint returns a
+  derived reference price without an IEX agreement; it may be added for dashboard display.

@@ -1,8 +1,15 @@
 # Research protocol
 
-## Backtest fill model
+Backtests and the live paper simulation share one engine, `sim/core.py`. A test runs the
+live engine one evening at a time over two years and requires identical trades and equity
+to a single backtest over the same dates.
+
+## Fill model
 
 For each trading day D:
+
+0. **Corporate actions:** splits rescale positions and pending orders; cash dividends going
+   ex on D are credited for shares held at the previous close.
 
 1. **Open:** orders decided at close(D−1) fill at open(D) plus half-spread and slippage.
    Exits fill before entries. Entries are on-open limit orders at close(D−1) × 1.01: an open
@@ -14,7 +21,8 @@ For each trading day D:
 4. **Decisions:** the strategy sees bars through D only. Entries are sized from close(D).
 
 Default costs (deliberately pessimistic for SPY/QQQ/IWM): 2 bp half-spread + 3 bp slippage
-per fill, +5 bp on stop fills, SEC Section 31 fee and FINRA TAF on sells, no commission.
+per fill, +5 bp on stop fills, SEC Section 31 fee and FINRA TAF on sells. Commission per
+order is configurable. Currency conversion (CAD to USD) is not modelled; results are in USD.
 
 ## Risk rules (shared with the live engine: `engine/risk.py`)
 

@@ -5,16 +5,13 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tradinglab"
 version = "0.1.0"
-description = "Private, paper-only quantitative trading research lab (Alpaca paper API)."
+description = "Private, simulation-only quantitative trading research lab."
 requires-python = ">=3.12,<3.14"
 readme = "README.md"
 license = { text = "Proprietary - personal use" }
 dependencies = [
-    # Broker + data. alpaca-py is imported ONLY inside tradinglab.broker.alpaca_paper
-    # and tradinglab.marketdata.alpaca_data, always behind the paper-only guard.
-    "alpaca-py>=0.40,<1.0",
-    "pandas>=2.2",
-    "numpy>=1.26",
+    # The engine, simulator, safety layer and data client use only the standard library.
+    # No brokerage SDK is (or may be) a dependency: see docs/SAFETY.md.
     "tzdata>=2024.1",
 ]
 
@@ -43,10 +40,15 @@ pythonpath = ["src"]
 addopts = "-q"
 
 [tool.ruff]
-line-length = 100
+line-length = 110
 target-version = "py312"
 src = ["src", "tests"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "S"]
-ignore = ["S101"]  # asserts are fine in tests
+ignore = ["S101"]  # asserts document invariants
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "E501"]
+"src/tradinglab/research/cli.py" = ["E501"]  # report templates
+"src/tradinglab/research/synthetic.py" = ["S311"]  # seeded test data, not cryptography

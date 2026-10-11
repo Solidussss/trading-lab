@@ -1,58 +1,29 @@
-# Paper-only safety model
+# No-real-trading safety model
 
-The lab must never place a real-money trade. That property does not rest on any single
-check; seven independent layers each block it, and the test suite attacks every layer.
+Trading Lab is simulation-only. It has no brokerage account, no brokerage SDK and no
+order-routing code. Every "order" is a record in the simulator's own ledger, filled against
+market data. The layers below make it structurally impossible to reach a brokerage, and the
+test suite attacks each one (`tests/test_no_real_trading.py`).
 
 | # | Layer | Where | What it stops |
 |---|---|---|---|
-| 1 | Fail-closed configuration | `config.py` | `TRADING_MODE` must be exactly `paper`. Missing, malformed or ambiguous settings abort startup: generic `APCA_*`/`ALPACA_API_KEY` variables, any variable with LIVE in an Alpaca name, live-format (`AK…`) or unknown-format keys, risk limits above hard ceilings, any `*_PROXY` variable in any environment, and padded or empty values (never silently trimmed or defaulted). |
-| 2 | Hostname allowlist | `safety/endpoints.py` | Only `paper-api.alpaca.markets` (trading) and `data.alpaca.markets` / `stream.data.alpaca.markets` (read-only data). Live hosts are on a denylist checked first; unknown `*.alpaca.markets` hosts are refused. Disguised hosts (userinfo tricks, ports, trailing dots, case, Unicode look-alike dots, zero-width characters) are IDNA-normalised exactly as the socket layer would before checking. |
-| 3 | Client factory | `broker/alpaca_paper.py` | `TradingClient` is built in exactly one place, always with `paper=True` **and** an explicit validated `url_override`. The client's effective base URL is then read back and re-validated; if it cannot be read, construction fails. |
-| 4 | Pre-write re-verification | `AlpacaPaperBroker.submit_order/cancel_order` | The client's URL is re-checked immediately before every write, so tampering after construction is caught. |
-| 5 | Order gate | `safety/order_gate.py` | Raises if the broker is not paper. Enforces emergency pause, symbol allowlist, long-only (no sell beyond held quantity), duplicate `client_order_id`, and halt rules. `ORDER_SUBMISSION_ENABLED=false` (the default) turns every approved order into a logged dry run. Brokers' `submit_order` requires an approving decision bound to that exact `client_order_id`. |
-| 6 | Process network guard | `safety/network_guard.py` | A Python audit hook inspects every DNS lookup, socket connect and `http.client` connection (including the CONNECT tunnel target behind a proxy) in the whole process. Live or unknown Alpaca hosts raise before a packet is sent. Audit hooks cannot be removed. Alpaca HTTP sessions also have `trust_env` disabled so OS/env proxies are ignored. |
-| 7 | Startup self-check | `safety/selfcheck.py` | Every process proves layers 1, 2 and 6 at boot by actually attempting to resolve each live host and requiring the guard to block it. It also fails if any OS-level proxy is configured or if asyncio is not using its stock event loop (uvloop bypasses audit hooks; the server deliberately installs plain `uvicorn`, not `uvicorn[standard]`). Failure exits non-zero. |
-
-Plus static checks in the test suite: no `paper=False` anywhere, live hostnames only in the
-denylist, `TradingClient` only in the adapter, `url_override` only in the two vetted adapters,
-no legacy `alpaca_trade_api` or Broker API SDKs, no committed `.env` or key-shaped strings.
-
-## Proof
-
-`tests/test_live_trading_impossible.py` is organised by attack route (configuration, client
-factory, adapter tampering, order gate, network, source code). Run it with:
-
-```
-pytest tests/test_live_trading_impossible.py -v
-```
-
-## Independent audit
-
-Before delivery, a separate reviewer that had not seen the implementation audited this layer
-and the backtester. It found no live-trading path in the primary flow, and eleven weaknesses
-in backup layers and research integrity (Unicode look-alike hosts, proxies, uvloop,
-drawdown-halt reset, test-vault aliasing, partial bars, gap-up exposure, gate bypass, lax
-parsing, secret pickling, narrow source scans). All were fixed and each has a regression test.
+| 1 | Fail-closed configuration | `config.py` | `TRADING_MODE` must be exactly `simulated`. Any variable that looks like brokerage configuration (`ALPACA_*`, `IBKR_*`, `QUESTRADE_*`, `WEALTHSIMPLE_*`, `BROKER_*`, …) aborts startup, as do proxies, malformed tokens, padded or empty values, and risk limits above hard ceilings. A `DATABASE_URL` pointing at a brokerage domain is refused. |
+| 2 | Egress allowlist | `safety/endpoints.py` | The process may reach only `api.tiingo.com` (data), `api.anthropic.com` (research), its PostgreSQL host, and loopback/private addresses. Everything else is refused, including unknown hosts and public IP literals. Known brokerage and trading-venue domains (40+, incl. all major Canadian brokers) are denied first and can never be added to the allowlist. |
+| 3 | Process network guard | `safety/network_guard.py` | A Python audit hook enforces layer 2 on every DNS lookup, socket connect and `http.client` connection (including the CONNECT tunnel target behind a proxy) made by any library in the process. Hosts are IDNA-normalised first, so Unicode look-alikes and zero-width characters can't disguise a destination. Audit hooks cannot be removed; production freezes the allowlist at startup. |
+| 4 | Startup self-check | `safety/selfcheck.py` | Every process proves layers 1–3 at boot by actually attempting to resolve brokerage hosts and an unknown host and requiring the guard to block them. It also fails if any OS-level proxy is configured or if asyncio is not using its stock event loop (uvloop does DNS in C, bypassing audit hooks; the server installs plain `uvicorn`, not `uvicorn[standard]`). |
+| 5 | Source-code rules | `tests/test_no_real_trading.py` | No brokerage SDK imports; brokerage domains appear only in the denylist; no `submit_order`/`place_order` implementation outside the documented future interface; outbound HTTP only in the vetted data client (stdlib `urllib`) and, later, the Claude client. |
 
 ## Known limits (stated plainly)
 
-- The network guard matches hostnames. Code that resolved a live host's IP elsewhere and
-  connected to the raw IP would not be caught by layer 6; layers 1–5 still apply, and the
-  source-code checks forbid live hostnames in the codebase.
-- Code that uses a library doing DNS/sockets in C (as uvloop does) bypasses layer 6. The
-  self-check refuses uvloop, but any new native networking dependency must be reviewed.
-- The gate-approval requirement stops accidental bypass, not deliberate forgery: code inside
-  this process could construct an approving decision. Layers 1–4 and 6 still confine any
-  order to the paper endpoint.
-- Key-prefix checks (`PK` paper / `AK` live) reflect Alpaca's current key format. If Alpaca
-  changes formats, startup fails closed with a clear message rather than guessing.
-- With `ORDER_SUBMISSION_ENABLED=true`, orders go to the **paper** endpoint. Enabling it is
-  a deliberate, separate step that requires your explicit approval.
+- Libraries that do networking in C (like uvloop) bypass layer 3. The self-check refuses
+  uvloop; any new native networking dependency must be reviewed.
+- Layer 3 matches hostnames. Private-range IP literals are allowed (Railway's internal
+  network uses them for the database).
+- Static checks look for known SDKs and patterns; they are a tripwire, not a proof against
+  deliberate circumvention by someone editing the code.
 
-## Activation checklist (before `ORDER_SUBMISSION_ENABLED=true`)
+## Future brokerage integration
 
-1. Full test suite green in CI on Python 3.12 with real dependencies.
-2. Self-check passes on Railway with the production environment.
-3. At least five sessions of dry-run decisions reviewed on the dashboard.
-4. Broker reconciliation shows zero unexplained differences.
-5. Your explicit written approval.
+`broker/base.py` documents the interface a brokerage adapter would implement. Adding one
+would require removing that venue from the denylist, new safety tests, and your explicit
+approval. Nothing in V1 implements it.

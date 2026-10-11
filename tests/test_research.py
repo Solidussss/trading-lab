@@ -3,12 +3,11 @@
 import math
 import tempfile
 import unittest
-from datetime import UTC, date, datetime, timedelta
+from datetime import date
 from pathlib import Path
-from types import SimpleNamespace
 
-from tests.helpers import settings
-from tradinglab.marketdata.alpaca_data import AlpacaDailyBars, RateLimiter, clamp_end_for_free_sip
+from tests.helpers import FAKE_TIINGO_TOKEN
+from tradinglab.marketdata.tiingo import RateLimiter
 from tradinglab.marketdata.bars import Bar, BarSeries, DatasetMeta, load_series, save_series
 from tradinglab.marketdata.calendar import trading_days
 from tradinglab.research.backtest import BacktestConfig, EquityPoint
@@ -244,54 +243,88 @@ class DataCacheTests(unittest.TestCase):
                 load_series(path)
 
 
-class AlpacaDataClientTests(unittest.TestCase):
-    def test_end_clamped_for_free_sip(self):
-        now = datetime(2026, 10, 9, 20, 5, tzinfo=UTC)
-        self.assertEqual(clamp_end_for_free_sip(now, now), now - timedelta(minutes=16))
-        early = now - timedelta(days=1)
-        self.assertEqual(clamp_end_for_free_sip(early, now), early)
+class TiingoClientTests(unittest.TestCase):
+    ROW = {"date": "2026-10-09T00:00:00.000Z", "open": 670.1, "high": 672.5, "low": 668.0,
+           "close": 671.2, "volume": 55000000, "adjClose": 671.2, "divCash": 0.0,
+           "splitFactor": 1.0}
 
-    def test_fetch_uses_sip_split_and_clamps(self):
-        captured = {}
+    def client(self, responses, calls=None):
+        from tradinglab.config import Secret
+        from tradinglab.marketdata.tiingo import TiingoClient
 
-        class FakeBars(AlpacaDailyBars):
-            def build_request(self, **kw):
-                captured.update(kw)
-                return kw
+        calls = calls if calls is not None else []
+        it = iter(responses)
 
-        ts = datetime(2026, 10, 8, 4, 0, tzinfo=UTC)
-        bar = SimpleNamespace(timestamp=ts, open=1, high=2, low=0.5, close=1.5, volume=10)
-        client = SimpleNamespace(get_stock_bars=lambda req: SimpleNamespace(data={"SPY": [bar]}))
-        src = FakeBars(settings(), client=client)
-        now = datetime(2026, 10, 9, 20, 10, tzinfo=UTC)
-        series, metas = src.fetch(["SPY"], date(2015, 1, 1), date(2026, 10, 9), now_utc=now)
-        self.assertEqual((captured["feed"], captured["adjustment"]), ("sip", "split"))
-        self.assertEqual(captured["start"].date(), date(2016, 1, 1))  # free history floor
-        self.assertLessEqual(captured["end"], now - timedelta(minutes=15))
-        self.assertEqual(series["SPY"].bars[0].day, date(2026, 10, 8))
-        self.assertEqual(metas["SPY"].feed, "sip")
+        def http_get(url, headers, timeout):
+            calls.append((url, headers))
+            r = next(it)
+            if isinstance(r, Exception):
+                raise r
+            return r
 
-    def test_fetch_during_session_never_returns_todays_partial_bar(self):
-        captured = {}
+        return TiingoClient(Secret(FAKE_TIINGO_TOKEN), http_get=http_get,
+                            limiter=RateLimiter(1000, 1), sleep=lambda s: None), calls
 
-        class FakeBars(AlpacaDailyBars):
-            def build_request(self, **kw):
-                captured.update(kw)
-                return kw
+    def test_parses_rows_with_session_date_and_corporate_actions(self):
+        import json as _json
 
-        def bar_for(d):
-            return SimpleNamespace(timestamp=datetime(d.year, d.month, d.day, 4, tzinfo=UTC),
-                                   open=1, high=2, low=0.5, close=1.5, volume=10)
+        rows = [self.ROW, {**self.ROW, "date": "2026-09-19T00:00:00.000Z", "divCash": 1.85}]
+        rows.sort(key=lambda r: r["date"])
+        c, calls = self.client([(200, _json.dumps(rows).encode())])
+        s = c.daily("SPY", date(2026, 9, 1), date(2026, 10, 9))
+        self.assertEqual([b.day for b in s.bars], [date(2026, 9, 19), date(2026, 10, 9)])
+        self.assertEqual(s.bars[0].dividend, 1.85)
+        url, headers = calls[0]
+        self.assertTrue(url.startswith("https://api.tiingo.com/tiingo/daily/spy/prices?"))
+        self.assertIn("startDate=2026-09-01", url)
+        self.assertNotIn(FAKE_TIINGO_TOKEN, url)  # token only in the header
+        self.assertEqual(headers["Authorization"], f"Token {FAKE_TIINGO_TOKEN}")
 
-        # Friday 2026-10-09 at 13:00 ET: the session is in progress.
-        days = [date(2026, 10, 8), date(2026, 10, 9)]
-        client = SimpleNamespace(get_stock_bars=lambda req: SimpleNamespace(
-            data={"SPY": [bar_for(d) for d in days]}))
-        now = datetime(2026, 10, 9, 17, 0, tzinfo=UTC)
-        series, _ = FakeBars(settings(), client=client).fetch(
-            ["SPY"], date(2026, 10, 1), date(2026, 10, 9), now_utc=now)
-        self.assertEqual(series["SPY"].bars[-1].day, date(2026, 10, 8))
-        self.assertLessEqual(captured["end"], datetime(2026, 10, 9, 0, 0, tzinfo=UTC))
+    def test_history_floor_2016(self):
+        c, calls = self.client([(200, b"[]")])
+        c.daily("QQQ", date(2010, 1, 1), date(2016, 6, 1))
+        self.assertIn("startDate=2016-01-01", calls[0][0])
+
+    def test_retries_transient_then_succeeds(self):
+        import json as _json
+
+        c, calls = self.client([TimeoutError(), (503, b""), (429, b""),
+                                (200, _json.dumps([self.ROW]).encode())])
+        self.assertEqual(len(c.daily("IWM", date(2026, 10, 1), date(2026, 10, 9))), 1)
+        self.assertEqual(len(calls), 4)
+
+    def test_auth_failure_is_not_retried_and_hides_token(self):
+        from tradinglab.marketdata.tiingo import DataProviderError
+
+        c, calls = self.client([(401, b'{"detail":"Invalid token"}')])
+        with self.assertRaises(DataProviderError) as ctx:
+            c.daily("SPY", date(2026, 10, 1), date(2026, 10, 9))
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn(FAKE_TIINGO_TOKEN, str(ctx.exception))
+
+    def test_gives_up_after_max_attempts(self):
+        from tradinglab.marketdata.tiingo import DataProviderError
+
+        c, _ = self.client([(500, b"")] * 4)
+        with self.assertRaises(DataProviderError):
+            c.daily("SPY", date(2026, 10, 1), date(2026, 10, 9))
+
+    def test_malformed_payloads(self):
+        from tradinglab.marketdata.tiingo import DataProviderError
+
+        for body in (b"not json", b'{"detail":"x"}', b'[{"date":"2026-10-09"}]'):
+            c, _ = self.client([(200, body)])
+            with self.subTest(body=body), self.assertRaises(DataProviderError):
+                c.daily("SPY", date(2026, 10, 1), date(2026, 10, 9))
+
+    def test_bad_rows_are_flagged_not_used(self):
+        import json as _json
+
+        bad = {**self.ROW, "date": "2026-10-08T00:00:00.000Z", "high": 1.0}  # high < open
+        c, _ = self.client([(200, _json.dumps([bad, self.ROW]).encode())])
+        s = c.daily("SPY", date(2026, 10, 1), date(2026, 10, 9))
+        self.assertEqual(len(s), 1)
+        self.assertIn("bad_ohlc", {i.kind for i in s.issues})
 
     def test_rate_limiter(self):
         t = [0.0]

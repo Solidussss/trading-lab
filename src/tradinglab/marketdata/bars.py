@@ -20,12 +20,21 @@ from tradinglab.marketdata.calendar import trading_days
 
 @dataclass(frozen=True, slots=True)
 class Bar:
+    """One session of RAW (unadjusted) prices plus that day's corporate actions.
+
+    dividend: cash dividend per share going ex on this day (0 if none).
+    split:    split factor taking effect on this day (2.0 = 2-for-1; 1.0 if none).
+    Fills always use raw prices; strategies see a split-adjusted view (history_through).
+    """
+
     day: date
     open: float
     high: float
     low: float
     close: float
     volume: float
+    dividend: float = 0.0
+    split: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -47,6 +56,7 @@ class BarSeries:
     def __post_init__(self) -> None:
         self.bars, self.issues = _clean(self.symbol, self.bars)
         self._index = {b.day: i for i, b in enumerate(self.bars)}
+        self._has_splits = any(b.split != 1.0 for b in self.bars)
 
     def __len__(self) -> int:
         return len(self.bars)
@@ -63,10 +73,15 @@ class BarSeries:
         return self.bars[i] if i is not None else None
 
     def history_through(self, d: date) -> Sequence[Bar]:
-        """Bars up to and including `d` - the ONLY view a strategy ever receives."""
+        """Bars up to and including `d` - the ONLY view a strategy ever receives.
+
+        Prices are split-adjusted *as of d* (earlier bars divided by every split that took
+        effect after them, up to and including d), so indicators are continuous across a
+        split while the last bar equals the raw price traded on d. Splits after d are never
+        applied, which keeps the view free of look-ahead.
+        """
         i = self._index.get(d)
         if i is None:
-            # last bar strictly before d
             lo, hi = 0, len(self.bars)
             while lo < hi:
                 mid = (lo + hi) // 2
@@ -74,8 +89,21 @@ class BarSeries:
                     lo = mid + 1
                 else:
                     hi = mid
-            return self.bars[:lo]
-        return self.bars[: i + 1]
+            end = lo
+        else:
+            end = i + 1
+        window = self.bars[:end]
+        if not self._has_splits or not any(b.split != 1.0 for b in window[1:]):
+            return window
+        out: list[Bar] = [window[-1]]
+        factor = 1.0
+        for j in range(len(window) - 2, -1, -1):
+            factor *= window[j + 1].split  # split effective on day j+1 applies to bar j
+            b = window[j]
+            out.append(Bar(b.day, b.open / factor, b.high / factor, b.low / factor,
+                           b.close / factor, b.volume * factor, b.dividend / factor, b.split))
+        out.reverse()
+        return out
 
     def missing_sessions(self, start: date | None = None, end: date | None = None) -> list[date]:
         if not self.bars:
@@ -95,10 +123,10 @@ def _clean(symbol: str, bars: Iterable[Bar]) -> tuple[list[Bar], list[DataIssue]
             issues.append(DataIssue(symbol, b.day, "unsorted"))
         prev = b.day
         vals = (b.open, b.high, b.low, b.close)
-        if not all(math.isfinite(v) for v in (*vals, b.volume)):
+        if not all(math.isfinite(v) for v in (*vals, b.volume, b.dividend, b.split)):
             issues.append(DataIssue(symbol, b.day, "non_finite"))
             continue
-        if min(vals) <= 0:
+        if min(vals) <= 0 or b.split <= 0 or b.dividend < 0:
             issues.append(DataIssue(symbol, b.day, "non_positive"))
             continue
         if b.high < max(b.open, b.close) - 1e-9 or b.low > min(b.open, b.close) + 1e-9:
@@ -119,15 +147,15 @@ def _clean(symbol: str, bars: Iterable[Bar]) -> tuple[list[Bar], list[DataIssue]
 
 # --- reproducible cache -------------------------------------------------------------------
 
-CSV_FIELDS = ("day", "open", "high", "low", "close", "volume")
+CSV_FIELDS = ("day", "open", "high", "low", "close", "volume", "dividend", "split")
 
 
 @dataclass(frozen=True)
 class DatasetMeta:
     symbol: str
-    source: str  # e.g. "alpaca", "synthetic"
-    feed: str  # e.g. "sip", "iex"
-    adjustment: str  # e.g. "split", "all", "raw"
+    source: str  # e.g. "tiingo", "synthetic"
+    feed: str  # e.g. "eod"
+    adjustment: str  # "raw" (with dividend/split columns) is the stored form
     start: str
     end: str
     fetched_at: str
@@ -143,7 +171,7 @@ def save_series(series: BarSeries, directory: Path, meta: DatasetMeta) -> Path:
         w.writerow(CSV_FIELDS)
         for b in series.bars:
             w.writerow([b.day.isoformat(), repr(b.open), repr(b.high), repr(b.low),
-                        repr(b.close), repr(b.volume)])
+                        repr(b.close), repr(b.volume), repr(b.dividend), repr(b.split)])
     digest = file_sha256(path)
     meta_out = DatasetMeta(**{**asdict(meta), "rows": len(series), "sha256": digest})
     path.with_suffix(".meta.json").write_text(json.dumps(asdict(meta_out), indent=2))
@@ -161,7 +189,8 @@ def load_series(path: Path) -> tuple[BarSeries, DatasetMeta]:
         for row in csv.DictReader(fh):
             bars.append(Bar(date.fromisoformat(row["day"]), float(row["open"]),
                             float(row["high"]), float(row["low"]), float(row["close"]),
-                            float(row["volume"])))
+                            float(row["volume"]), float(row.get("dividend") or 0.0),
+                            float(row.get("split") or 1.0)))
     return BarSeries(meta.symbol, bars), meta
 
 
@@ -171,7 +200,8 @@ def data_fingerprint(data: dict[str, BarSeries]) -> str:
     for sym in sorted(data):
         h.update(sym.encode())
         for b in data[sym].bars:
-            h.update(f"{b.day}|{b.open!r}|{b.high!r}|{b.low!r}|{b.close!r}|{b.volume!r}".encode())
+            h.update(f"{b.day}|{b.open!r}|{b.high!r}|{b.low!r}|{b.close!r}|{b.volume!r}|"
+                     f"{b.dividend!r}|{b.split!r}".encode())
     return h.hexdigest()
 
 
