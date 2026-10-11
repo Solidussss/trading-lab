@@ -41,6 +41,21 @@ Tiingo EOD API ──► marketdata/tiingo.py ──► BarSource
 - **Modular:** `broker/base.py` documents the interface a brokerage adapter would need, but
   none exists and the safety layer forbids one in V1.
 
+## Deploy on Railway
+
+1. New Project → Deploy from GitHub repo → `trading-lab`. Railway reads `railway.json`
+   (start command `python main.py`, health check `/healthz`).
+2. Service → Variables:
+   - `APP_ENV` = `production`
+   - `TRADING_MODE` = `simulated`
+   - `DASHBOARD_PASSWORD` = a password of at least 12 characters (you log in with any
+     username and this password)
+   - `TIINGO_API_TOKEN` = your Tiingo token
+3. Service → Settings → Networking → Generate Domain. Open it on your phone.
+
+Do not add brokerage or proxy variables: the app refuses to start its trading functions
+if it sees them.
+
 ## Quick start (local)
 
 ```bash

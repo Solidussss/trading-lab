@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from tradinglab.config import ConfigError, Settings, load_settings
 from tradinglab.safety.endpoints import BrokerageForbiddenError, EgressDeniedError
 from tradinglab.safety.network_guard import (
+    expected_blocks,
     freeze_egress,
     install_network_guard,
     is_installed,
@@ -49,7 +50,8 @@ def standard_event_loop() -> bool:
 
 def _blocked(host: str, expected: type[Exception]) -> bool:
     try:
-        socket.getaddrinfo(host, 443)
+        with expected_blocks():
+            socket.getaddrinfo(host, 443)
     except expected:
         return True
     except OSError:

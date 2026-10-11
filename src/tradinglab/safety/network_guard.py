@@ -44,6 +44,7 @@ _blocked_attempts: list[str] = []
 _resolved: OrderedDict[str, str] = OrderedDict()  # ip -> allowlisted hostname it came from
 _MAX_RESOLVED = 512
 _real_getaddrinfo = socket.getaddrinfo
+_probe = threading.local()  # set while the self-check deliberately probes blocked hosts
 
 _EVENTS = frozenset({"socket.getaddrinfo", "socket.gethostbyname", "socket.connect",
                      "socket.sendto", "socket.sendmsg", "http.client.connect"})
@@ -108,7 +109,10 @@ def _audit_hook(event: str, args: tuple[Any, ...]) -> None:
             _check_host(host)
         except (BrokerageForbiddenError, EgressDeniedError) as exc:
             _blocked_attempts.append(host)
-            log.critical("NETWORK GUARD blocked %s to %r: %s", event, host, exc)
+            if getattr(_probe, "active", False):
+                log.info("self-check: %s to %r blocked as expected", event, host)
+            else:
+                log.critical("NETWORK GUARD blocked %s to %r: %s", event, host, exc)
             raise
 
 
@@ -158,6 +162,16 @@ def install_network_guard(extra_allowed: Iterable[str] = ()) -> None:
             _installed = True
             log.info("Egress guard installed; allowed hosts: %s",
                      ", ".join(sorted(_policy.allowed_hosts)))
+
+
+class expected_blocks:  # noqa: N801 - used as a context manager
+    """Context in which guard blocks are expected (self-check probes): logged at INFO."""
+
+    def __enter__(self):
+        _probe.active = True
+
+    def __exit__(self, *exc):
+        _probe.active = False
 
 
 def freeze_egress() -> None:

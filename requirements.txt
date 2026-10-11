@@ -1,0 +1,2 @@
+# Runtime dependencies for Railway. The core uses only the standard library.
+tzdata>=2024.1
