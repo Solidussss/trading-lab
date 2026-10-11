@@ -52,8 +52,8 @@ class WebTests(unittest.TestCase):
         port, state = self.start()
         status, body, headers = self.get(port, password=PASSWORD)
         self.assertEqual(status, 200)
-        self.assertIn("Safety self-check passed", body)
-        self.assertIn("SPY, QQQ, IWM", body)
+        self.assertIn("Safety checks passed", body)
+        self.assertIn("Getting ready", body)
         self.assertNotIn(FAKE_TIINGO_TOKEN, body)
         self.assertNotIn(PASSWORD, body)
         self.assertEqual(headers["Cache-Control"], "no-store")
@@ -84,7 +84,7 @@ class WebTests(unittest.TestCase):
         self.assertIsNotNone(state.error)
         status, body, _ = self.get(port, password=PASSWORD)
         self.assertEqual(status, 200)
-        self.assertIn("Not ready", body)
+        self.assertIn("a safety check failed", body)
         self.assertIn("TRADING_MODE", body)
 
     def test_unknown_path_404(self):
@@ -140,26 +140,42 @@ class DashboardTests(unittest.TestCase):
         conn.close()
         return r.status
 
-    def test_overview_shows_portfolio(self):
+    def test_overview_explains_in_plain_english(self):
         port, _ = self.start()
-        status, body, _ = WebTests.get(self, port, password=PASSWORD)
+        status, body, headers = WebTests.get(self, port, password=PASSWORD)
         self.assertEqual(status, 200)
-        for text in ("Portfolio", "Equity", "Total P&amp;L", "Open positions",
-                     "Orders for the next open", "Latest decisions", "Recent trades",
-                     "Engine", "Activity log", "System &amp; safety", "<svg"):
+        for text in ("Your money", "Your three funds", "What it", "How the bot works",
+                     "Pause new buys", "Safety checks passed", "simply bought SPY",
+                     "50-day average", "200-day average", "<svg", "S&amp;P 500"):
             self.assertIn(text, body)
         st = self.store.load_state()
-        self.assertIn(f"{st.last_session.strftime('%a %b %d, %Y')} close", body)
-        self.assertNotIn("sma_fast", body)  # reasons are shown in plain English
-        if self.store.trades():
-            self.assertIn(self.store.trades()[-1].symbol, body)
+        self.assertIn(f"Based on {st.last_session.strftime('%a %b')} {st.last_session.day}", body)
+        for jargon in ("sma_fast", "sma_slow", "exposure", "drawdown", "P&amp;L", "sized_by"):
+            self.assertNotIn(jargon, body)
+        for sym in st.positions:
+            self.assertIn(f"Holding {st.positions[sym].shares} shares", body)
+        for o in st.pending:
+            self.assertIn(f"{o.shares} shares when the market opens", body)
+        trade = self.store.trades()[-1]
+        self.assertIn(f"Sold {trade.shares} {trade.symbol}", body)
+        self.assertIn("https://fonts.gstatic.com", headers["Content-Security-Policy"])
+        self.assertNotIn("script-src", headers["Content-Security-Policy"])
+
+    def test_reasons_are_translated(self):
+        from tradinglab.web.views import why
+
+        self.assertEqual(why("uptrend: close>slow & fast>slow; sized_by=risk_budget"),
+                         "it's in an uptrend")
+        self.assertIn("safety stop", why("stop_hit"))
+        self.assertIn("above the price limit", why("open 101.5 above limit 101.0"))
 
     def test_controls_pause_and_resume_with_csrf(self):
         port, state = self.start()
         self.assertEqual(self.post(port, f"action=pause&csrf={state.csrf}"), 303)
         self.assertTrue(self.store.get_flag("paused"))
         _, body, _ = WebTests.get(self, port, password=PASSWORD)
-        self.assertIn("Resume new entries", body)
+        self.assertIn("Resume buying", body)
+        self.assertIn("Paused by you", body)
         self.assertEqual(self.post(port, f"action=resume&csrf={state.csrf}"), 303)
         self.assertFalse(self.store.get_flag("paused"))
 
@@ -180,7 +196,7 @@ class DashboardTests(unittest.TestCase):
                          system_proxies=dict, store=InMemoryStore())
         from tradinglab.web.server import render_page
 
-        self.assertIn("starts on the", render_page(state))
+        self.assertIn("Getting ready", render_page(state))
 
     def test_build_state_waits_for_database(self):
         from tradinglab.web import server

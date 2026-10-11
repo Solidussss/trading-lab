@@ -55,6 +55,8 @@ class Store(Protocol):
     def set_flag(self, name: str, value: bool, at: datetime | None = None) -> None: ...
     def flag_at(self, name: str, when: datetime, default: bool = False) -> bool: ...
     def run_lock(self) -> contextlib.AbstractContextManager[None]: ...
+    def save_prices(self, symbol: str, bars: list[Bar]) -> None: ...
+    def price_history(self, symbol: str, n: int = 320) -> list[Bar]: ...
 
 
 class InMemoryStore:
@@ -67,6 +69,7 @@ class InMemoryStore:
         self._bars: dict[date, dict[str, Bar | None]] = {}
         self._events: list[EngineEvent] = []
         self._flags: dict[str, list[tuple[datetime, bool]]] = {}  # name -> history
+        self._prices: dict[str, dict[date, Bar]] = {}  # display-only price history
         self._lock = threading.Lock()
         self.fail_next_commit = False  # failure injection for atomicity tests
 
@@ -134,6 +137,13 @@ class InMemoryStore:
             if t <= when:
                 value = v
         return value
+
+    def save_prices(self, symbol, bars):
+        self._prices.setdefault(symbol, {}).update({b.day: b for b in bars})
+
+    def price_history(self, symbol, n=320):
+        bars = self._prices.get(symbol, {})
+        return [bars[d] for d in sorted(bars)][-n:]
 
     @contextlib.contextmanager
     def run_lock(self) -> Iterator[None]:

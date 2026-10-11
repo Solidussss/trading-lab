@@ -14,7 +14,7 @@ from tests import pgwire
 from tests.helpers import settings
 from tests.test_live_engine import DATA, SYMS, FlakySource, evening
 from tradinglab.engine.live import LiveSimulationEngine
-from tradinglab.engine.pg_store import PostgresStore
+from tradinglab.engine.pg_store import MIGRATIONS, PostgresStore
 from tradinglab.engine.store import EngineBusyError, EngineEvent, InMemoryStore
 from tradinglab.marketdata.calendar import trading_days
 from tradinglab.research.backtest import BacktestConfig, Backtester
@@ -42,7 +42,7 @@ class PgTestCase(unittest.TestCase):
         admin.close()
         self.connect = partial(pgwire.connect, HOST, int(PORT), "tl", self.dbname)
         self.store = PostgresStore(self.connect)
-        self.assertEqual(self.store.migrate(), 1)
+        self.assertEqual(self.store.migrate(), len(MIGRATIONS))
 
     def tearDown(self):
         self.store.close()
@@ -58,8 +58,16 @@ class PgTestCase(unittest.TestCase):
 
 class SchemaTests(PgTestCase):
     def test_migrations_are_idempotent(self):
-        self.assertEqual(self.store.migrate(), 1)
-        self.assertEqual(self.store.migrate(), 1)
+        self.assertEqual(self.store.migrate(), len(MIGRATIONS))
+        self.assertEqual(self.store.migrate(), len(MIGRATIONS))
+
+    def test_price_history_upsert(self):
+        bars = DATA["SPY"].bars[-5:]
+        self.store.save_prices("SPY", bars[:3])
+        self.store.save_prices("SPY", bars)  # overlapping save must upsert, not fail
+        self.assertEqual(self.store.price_history("SPY", 10), bars)
+        self.assertEqual(self.store.price_history("SPY", 2), bars[-2:])
+        self.assertEqual(self.store.price_history("QQQ"), [])
 
     def test_state_round_trip_and_flags(self):
         self.assertIsNone(self.store.load_state())

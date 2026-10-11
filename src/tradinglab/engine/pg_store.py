@@ -106,6 +106,21 @@ MIGRATIONS: list[str] = [
     );
     CREATE INDEX IF NOT EXISTS flags_name_idx ON flags(name, at);
     """,
+    # 2: recent daily prices for the dashboard charts (display only; never used for fills)
+    """
+    CREATE TABLE IF NOT EXISTS prices (
+        symbol text NOT NULL,
+        day date NOT NULL,
+        open double precision NOT NULL,
+        high double precision NOT NULL,
+        low double precision NOT NULL,
+        close double precision NOT NULL,
+        volume double precision NOT NULL,
+        dividend double precision NOT NULL DEFAULT 0,
+        split double precision NOT NULL DEFAULT 1,
+        PRIMARY KEY (symbol, day)
+    );
+    """,
 ]
 
 
@@ -325,6 +340,24 @@ class PostgresStore:
         rows = self._query("SELECT value FROM flags WHERE name = %s AND at <= %s "
                            "ORDER BY at DESC, id DESC LIMIT 1", (name, when))
         return rows[0][0] if rows else default
+
+    # -- display price history -------------------------------------------------------------
+
+    def save_prices(self, symbol: str, bars: list[Bar]) -> None:
+        with self._tx() as cur:
+            for b in bars:
+                cur.execute(
+                    "INSERT INTO prices (symbol, day, open, high, low, close, volume, dividend, "
+                    "split) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (symbol, day) DO UPDATE SET open = EXCLUDED.open, "
+                    "high = EXCLUDED.high, low = EXCLUDED.low, close = EXCLUDED.close, "
+                    "volume = EXCLUDED.volume, dividend = EXCLUDED.dividend, split = EXCLUDED.split",
+                    (symbol, b.day, b.open, b.high, b.low, b.close, b.volume, b.dividend, b.split))
+
+    def price_history(self, symbol: str, n: int = 320) -> list[Bar]:
+        rows = self._query("SELECT day, open, high, low, close, volume, dividend, split FROM prices "
+                           "WHERE symbol = %s ORDER BY day DESC LIMIT %s", (symbol, n))
+        return [Bar(*r) for r in reversed(rows)]
 
     # -- concurrency -----------------------------------------------------------------------
 

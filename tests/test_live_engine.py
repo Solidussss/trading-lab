@@ -261,6 +261,23 @@ class ConfigAndSettleTests(unittest.TestCase):
         self.assertEqual(store.load_state().last_session, early)
 
 
+class PriceHistoryTests(unittest.TestCase):
+    def test_prices_saved_on_run_and_backfilled_when_stale(self):
+        eng, store, source = engine()
+        eng.run(evening(date(2019, 3, 15)))
+        hist = store.price_history("SPY", 400)
+        self.assertEqual(hist[-1].day, date(2019, 3, 15))
+        self.assertLessEqual(len(hist), 320)
+        store._prices.clear()  # e.g. first deploy of the feature: portfolio exists, no prices
+        calls = source.calls
+        rep = eng.run(evening(date(2019, 3, 15)) + timedelta(hours=1))
+        self.assertEqual(rep.status, "up_to_date")
+        self.assertEqual(source.calls, calls + 1)
+        self.assertEqual(store.price_history("QQQ", 1)[-1].day, date(2019, 3, 15))
+        eng.run(evening(date(2019, 3, 15)) + timedelta(hours=2))
+        self.assertEqual(source.calls, calls + 1)  # not stale any more: no extra API calls
+
+
 class ControlsTests(unittest.TestCase):
     def test_pause_flag_reaches_the_core(self):
         eng, store, _ = engine()

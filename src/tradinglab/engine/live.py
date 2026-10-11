@@ -127,6 +127,7 @@ class LiveSimulationEngine:
             state.config_fingerprint = self.fingerprint
             self.store.save_state(state)
         if state.last_session >= target:
+            self._refresh_prices_if_stale(now, state.last_session)
             return report
 
         wanted = list(self.symbols) + sorted(s for s in state.positions if s not in self.symbols)
@@ -138,6 +139,7 @@ class LiveSimulationEngine:
             report.status = "data_error"
             report.messages.append(str(exc))
             return report
+        self._save_prices(data)
         self._flag_calendar_anomalies(now, data, state.last_session, target)
         for sym in wanted:
             if sym not in state.last_close:
@@ -177,6 +179,30 @@ class LiveSimulationEngine:
             report.processed.append(day)
             report.status = "processed"
         return report
+
+    # -- dashboard price history ----------------------------------------------------------
+
+    PRICE_HISTORY_BARS = 320
+
+    def _save_prices(self, data: dict[str, BarSeries]) -> None:
+        saver = getattr(self.store, "save_prices", None)
+        if saver is None:
+            return
+        for sym, series in data.items():
+            saver(sym, series.bars[-self.PRICE_HISTORY_BARS:])
+
+    def _refresh_prices_if_stale(self, now: datetime, last_session: date) -> None:
+        """Backfill chart prices once (e.g. after an upgrade) without touching the portfolio."""
+        reader = getattr(self.store, "price_history", None)
+        if reader is None:
+            return
+        stale = any(not (h := reader(s, 1)) or h[-1].day < last_session for s in self.symbols)
+        if not stale:
+            return
+        try:
+            self._save_prices(self.source.history(self.symbols, through=last_session))
+        except Exception as exc:  # display data only: never fail the run for it
+            self._event(now, None, "price_history_error", f"{type(exc).__name__}: {exc}")
 
     # -- data integrity -------------------------------------------------------------------
 
