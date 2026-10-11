@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import html
 import logging
+import sys
 import os
 import threading
 import time
@@ -543,7 +544,8 @@ def build_state(env: Mapping[str, str]) -> AppState:
 
 def serve(env: Mapping[str, str] | None = None) -> None:
     env = os.environ if env is None else env
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
     state = build_state(env)
     port = int(env.get("PORT", "8080"))
     httpd = ThreadingHTTPServer(("0.0.0.0", port), make_handler(state))  # noqa: S104

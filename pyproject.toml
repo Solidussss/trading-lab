@@ -51,4 +51,5 @@ ignore = ["S101"]  # asserts document invariants
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S", "E501"]
 "src/tradinglab/research/cli.py" = ["E501"]  # report templates
+"src/tradinglab/web/server.py" = ["E501"]  # HTML/CSS template
 "src/tradinglab/research/synthetic.py" = ["S311"]  # seeded test data, not cryptography

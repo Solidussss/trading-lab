@@ -10,6 +10,7 @@ one check and exits, for anyone who prefers a separate Railway cron service.
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -102,7 +103,8 @@ def run_nightly_once(env) -> int:
     """`python main.py nightly`: one engine check; non-zero exit when attention is needed."""
     from tradinglab.safety.selfcheck import SafetyCheckFailedError, run_selfcheck
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                        format="%(asctime)s %(levelname)s %(message)s")
     try:
         settings = run_selfcheck(env).settings
     except SafetyCheckFailedError as exc:
