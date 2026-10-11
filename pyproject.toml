@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tradinglab"
+version = "0.1.0"
+description = "Private, paper-only quantitative trading research lab (Alpaca paper API)."
+requires-python = ">=3.12,<3.14"
+readme = "README.md"
+license = { text = "Proprietary - personal use" }
+dependencies = [
+    # Broker + data. alpaca-py is imported ONLY inside tradinglab.broker.alpaca_paper
+    # and tradinglab.marketdata.alpaca_data, always behind the paper-only guard.
+    "alpaca-py>=0.40,<1.0",
+    "pandas>=2.2",
+    "numpy>=1.26",
+    "tzdata>=2024.1",
+]
+
+[project.optional-dependencies]
+# Phases 4-6 (database, API, dashboard backend). Declared now so the lock is stable.
+server = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.2",
+    "alembic>=1.13",
+    "argon2-cffi>=23.1",
+    "itsdangerous>=2.2",
+]
+research = ["anthropic>=0.40"]
+dev = ["pytest>=8.0", "ruff>=0.6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S"]
+ignore = ["S101"]  # asserts are fine in tests
