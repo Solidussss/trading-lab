@@ -288,8 +288,9 @@ def start_hype(state: AppState, settings: Any, env: Mapping[str, str]) -> None:
         return
     try:
         from tradinglab.engine.runtime import postgres_store
-        from tradinglab.hype.bot import HypeBot, HypeRunner
+        from tradinglab.hype.bot import FallbackSource, HypeBot, HypeRunner
         from tradinglab.hype.dexscreener import DexScreenerClient
+        from tradinglab.hype.geckoterminal import GeckoTerminalClient
         from tradinglab.hype.model import Rules
         from tradinglab.hype.store import PgHypeStore
 
@@ -297,7 +298,8 @@ def start_hype(state: AppState, settings: Any, env: Mapping[str, str]) -> None:
                       stake=float(env.get("HYPE_STAKE", "50")))
         store = PgHypeStore(state.store)  # page reads through the dashboard's connection
         runner = HypeRunner(
-            lambda: HypeBot(DexScreenerClient(), PgHypeStore(postgres_store(settings)), rules))
+            lambda: HypeBot(FallbackSource(GeckoTerminalClient(), DexScreenerClient()),
+                            PgHypeStore(postgres_store(settings)), rules))
         runner.store, runner.rules = store, rules  # type: ignore[attr-defined]
         state.hype = runner
         runner.start()

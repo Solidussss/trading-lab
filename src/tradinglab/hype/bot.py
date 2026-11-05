@@ -35,9 +35,39 @@ SCAN_EVERY = 2  # look for new coins every 2nd cycle (~1 min); open positions ev
 WATCH_SIZE = 12
 
 
+MISSING_LIMIT = 3  # checks in a row with no data before a pool counts as pulled
+
+
 class Source(Protocol):
-    def trending_tokens(self) -> list[str]: ...
-    def snapshots(self, tokens: list[str]) -> dict[str, Snapshot]: ...
+    def discover(self) -> list[Snapshot]: ...
+    def snapshots(self, tokens: list[str], pairs: dict[str, str] | None = None) -> dict[str, Snapshot]: ...
+
+
+class FallbackSource:
+    """Try each data source in turn; the first that answers wins."""
+
+    def __init__(self, *sources: Any) -> None:
+        self.sources = sources
+
+    def _first(self, call: Callable[[Any], Any]) -> Any:
+        errors = []
+        for src in self.sources:
+            try:
+                return call(src)
+            except Exception as exc:  # noqa: BLE001 - fall through to the next source
+                errors.append(f"{type(src).__name__}: {exc}")
+        raise RuntimeError("; ".join(errors) or "no data sources")
+
+    def discover(self) -> list[Snapshot]:
+        def call(src):
+            found = src.discover()
+            if not found:
+                raise RuntimeError("nothing returned")
+            return found
+        return self._first(call)
+
+    def snapshots(self, tokens, pairs=None):
+        return self._first(lambda src: src.snapshots(tokens, pairs))
 
 
 class HypeStore(Protocol):
@@ -104,11 +134,18 @@ class HypeBot:
     def _manage(self, acct: Account, now: datetime, closed: list[Trade]) -> None:
         if not acct.positions:
             return
-        snaps = self.source.snapshots([p.token for p in acct.positions])
+        snaps = self.source.snapshots([p.token for p in acct.positions],
+                                      {p.token: p.pair for p in acct.positions if p.pair})
         keep: list[Position] = []
         for p in acct.positions:
             s = snaps.get(p.token)
-            if s is not None:
+            if s is None:
+                p.missing += 1
+                if p.missing < MISSING_LIMIT:  # a data hiccup is not a rug: wait and see
+                    keep.append(p)
+                    continue
+            else:
+                p.missing = 0
                 p.last, p.last_liquidity = s.price, s.liquidity
                 p.peak = max(p.peak, s.price)
                 if not p.half_taken and p.gain() >= self.rules.take_half_at:
@@ -141,9 +178,7 @@ class HypeBot:
     def _scan(self, acct: Account, now: datetime) -> None:
         acct.cooldown = {t: u for t, u in acct.cooldown.items() if datetime.fromisoformat(u) > now}
         held = {p.token for p in acct.positions}
-        tokens = [t for t in self.source.trending_tokens() if t not in held][:90]
-        snaps = self.source.snapshots(tokens) if tokens else {}
-        ranked = sorted(snaps.values(), key=score, reverse=True)
+        ranked = sorted((s for s in self.source.discover() if s.token not in held), key=score, reverse=True)
         watch, bought = [], 0
         for s in ranked:
             no = entry_check(s, self.rules)
@@ -172,7 +207,7 @@ class HypeBot:
         acct.positions.append(Position(
             token=s.token, symbol=s.symbol, url=s.url, opened=_iso(now), stake=stake, qty=qty,
             entry_price=eff, seen_price=s.price, entry_liquidity=s.liquidity, entry_score=score(s),
-            why=why, peak=s.price, last=s.price, last_liquidity=s.liquidity))
+            why=why, peak=s.price, last=s.price, last_liquidity=s.liquidity, pair=s.pair))
         log.info("hype: bought %s for $%.0f (%s)", s.symbol, stake, why)
 
 

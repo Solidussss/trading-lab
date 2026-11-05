@@ -163,6 +163,8 @@ class Position:
     last_liquidity: float
     realized: float = 0.0  # USD already taken off the table
     half_taken: bool = False
+    pair: str = ""  # the pool it's priced from (survives restarts)
+    missing: int = 0  # consecutive checks with no data for this pool
 
     def gain(self, price: float | None = None) -> float:
         p = self.last if price is None else price

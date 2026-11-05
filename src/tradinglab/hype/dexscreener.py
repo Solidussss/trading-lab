@@ -153,7 +153,10 @@ class DexScreenerClient:
                     seen.setdefault(r["tokenAddress"], None)
         return list(seen)
 
-    def snapshots(self, tokens: Iterable[str]) -> dict[str, Snapshot]:
+    def discover(self) -> list[Snapshot]:
+        return list(self.snapshots(self.trending_tokens()[:90]).values())
+
+    def snapshots(self, tokens: Iterable[str], pairs: dict[str, str] | None = None) -> dict[str, Snapshot]:
         """Best (most liquid) pair per token. Tokens with no live pair are left out."""
         tokens = [t for t in dict.fromkeys(tokens) if t and t.isalnum() and len(t) <= 64]
         out: dict[str, Snapshot] = {}

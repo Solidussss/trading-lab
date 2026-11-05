@@ -36,10 +36,10 @@ class FakeSource:
         self.trending: list[str] = []
         self.data: dict[str, Snapshot] = {}
 
-    def trending_tokens(self):
-        return list(self.trending)
+    def discover(self):
+        return [self.data[t] for t in self.trending if t in self.data]
 
-    def snapshots(self, tokens):
+    def snapshots(self, tokens, pairs=None):
         return {t: self.data[t] for t in tokens if t in self.data}
 
 
@@ -171,6 +171,9 @@ class BotTest(unittest.TestCase):
     def test_vanished_pair_is_a_rug(self):
         self.bot.step()
         del self.src.data["TokA1"]
+        for _ in range(2):  # a couple of missing reads is a data hiccup, not a rug
+            self.clock.t += timedelta(minutes=1)
+            self.assertEqual(len(self.bot.step().positions), 1)
         self.clock.t += timedelta(minutes=1)
         a = self.bot.step()
         self.assertEqual(a.positions, [])
@@ -200,7 +203,7 @@ class BotTest(unittest.TestCase):
 
     def test_data_outage_keeps_books_and_reports(self):
         class Broken(FakeSource):
-            def snapshots(self, tokens):
+            def snapshots(self, tokens, pairs=None):
                 raise MarketDataError("down")
 
         self.bot.step()
@@ -210,6 +213,61 @@ class BotTest(unittest.TestCase):
         a = self.bot.step()
         self.assertEqual(len(a.positions), 1)  # nothing sold on missing data
         self.assertIn("down", a.last_error)
+
+
+GECKO = {
+    "data": [{"id": "solana_PoolA", "type": "pool", "attributes": {
+        "name": "WIF / SOL", "address": "PoolA", "base_token_price_usd": "0.0021",
+        "reserve_in_usd": "52000", "fdv_usd": "900000", "market_cap_usd": None,
+        "pool_created_at": "2026-11-05T13:00:00Z",
+        "price_change_percentage": {"m5": "9.5", "h1": "40"},
+        "transactions": {"m5": {"buys": 140, "sells": 60}, "h1": {"buys": 1200, "sells": 800}},
+        "volume_usd": {"m5": "15000", "h1": "60000"}},
+        "relationships": {"base_token": {"data": {"id": "solana_MintA"}}, "dex": {"data": {"id": "raydium"}}}},
+        {"id": "solana_bad", "type": "pool", "attributes": {"address": "Bad", "base_token_price_usd": None}}],
+    "included": [{"id": "solana_MintA", "type": "token",
+                  "attributes": {"address": "MintA", "symbol": "WIF", "name": "dogwifhat"}}],
+}
+
+
+class GeckoTest(unittest.TestCase):
+    def client(self, body, status=200):
+        from tradinglab.hype.geckoterminal import GeckoTerminalClient
+        self.urls = []
+
+        def http_get(url, headers, timeout):
+            self.urls.append(url)
+            return status, json.dumps(body).encode()
+        return GeckoTerminalClient(http_get=http_get, sleep=lambda s: None, clock_ms=lambda: NOW_MS)
+
+    def test_discover_parses_pools(self):
+        snaps = self.client(GECKO).discover()
+        self.assertEqual(len(snaps), 1)
+        s = snaps[0]
+        self.assertEqual((s.token, s.pair, s.symbol), ("MintA", "PoolA", "WIF"))
+        self.assertEqual(s.market_cap, 900000)  # falls back to FDV
+        self.assertAlmostEqual(s.age_min, 120)
+        self.assertAlmostEqual(s.vol_accel, 15000 / 5000)
+        self.assertTrue(all(u.startswith("https://api.geckoterminal.com/api/v2/") for u in self.urls))
+
+    def test_snapshots_by_pool(self):
+        c = self.client(GECKO)
+        self.assertEqual(set(c.snapshots(["MintA"], {"MintA": "PoolA"})), {"MintA"})
+        self.assertIn("/pools/multi/PoolA", self.urls[-1])
+        self.assertEqual(c.snapshots(["MintA"], {"MintA": "../x"}), {})
+
+    def test_fallback_source(self):
+        from tradinglab.hype.bot import FallbackSource
+
+        class Down:
+            def discover(self):
+                raise MarketDataError("429")
+
+        good = FakeSource()
+        good.trending, good.data = ["TokA1"], {"TokA1": hot()}
+        self.assertEqual(len(FallbackSource(Down(), good).discover()), 1)
+        with self.assertRaises(RuntimeError):
+            FallbackSource(Down()).discover()
 
 
 class SafetyTest(unittest.TestCase):

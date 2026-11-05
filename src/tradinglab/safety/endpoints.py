@@ -30,9 +30,12 @@ RESEARCH_HOST: Final = "api.anthropic.com"
 # is a data aggregator with no accounts, wallets or order entry; it cannot trade.
 CRYPTO_DATA_HOST: Final = "api.dexscreener.com"
 CRYPTO_DATA_URL: Final = f"https://{CRYPTO_DATA_HOST}"
+# GeckoTerminal (CoinGecko's on-chain pool data): the hype bot's primary feed. Read-only too.
+POOL_DATA_HOST: Final = "api.geckoterminal.com"
+POOL_DATA_URL: Final = f"https://{POOL_DATA_HOST}"
 
 DEFAULT_ALLOWED_HOSTS: Final[frozenset[str]] = frozenset(
-    {DATA_PROVIDER_HOST, RESEARCH_HOST, CRYPTO_DATA_HOST})
+    {DATA_PROVIDER_HOST, RESEARCH_HOST, CRYPTO_DATA_HOST, POOL_DATA_HOST})
 
 # Domains of brokerages and trading venues with order-entry APIs. Matched as the domain
 # itself or any subdomain. This list exists for clear errors and defence in depth: the
