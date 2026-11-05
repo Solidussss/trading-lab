@@ -53,4 +53,5 @@ ignore = ["S101"]  # asserts document invariants
 "src/tradinglab/research/cli.py" = ["E501"]  # report templates
 "src/tradinglab/web/views.py" = ["E501"]  # HTML/CSS template
 "src/tradinglab/web/views_bots.py" = ["E501"]  # HTML template
+"src/tradinglab/web/views_hype.py" = ["E501"]  # HTML/CSS template
 "src/tradinglab/research/synthetic.py" = ["S311"]  # seeded test data, not cryptography
