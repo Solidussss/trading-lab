@@ -218,10 +218,29 @@ def leaderboard_page(state: Any, now: datetime | None = None) -> str:
     body = (f"<section><h2>The bots</h2><p class='quiet small'>Each bot has its own "
             f"{money(capital_of(state), False)} of pretend money and its own strategy. Ranked by "
             f"how much each has made or lost since it started.</p><ol class='board'>{rows}</ol>"
-            "</section>" + research_section(state, now) + rules_section(state)
+            "</section>" + hype_link(state) + research_section(state, now) + rules_section(state)
             + controls(state))
     return _shell(state, big, sub, market_line(now, state.tz), body,
                   refresh=60 if market_open(now) else 0)
+
+
+def hype_link(state: Any) -> str:
+    """A card linking to the 24/7 Solana memecoin hype paper bot, with its running total."""
+    runner = getattr(state, "hype", None)
+    if runner is None or getattr(runner, "store", None) is None:
+        return ""
+    try:
+        from tradinglab.hype.bot import equity
+
+        acct = runner.store.load_hype()
+        total = equity(acct, runner.rules) - runner.rules.bankroll if acct else 0.0
+        line = (f"{signed(total)} on a pretend {money(runner.rules.bankroll, False)}, "
+                f"{len(acct.positions) if acct else 0} coins held")
+    except Exception:  # noqa: BLE001 - never break the leaderboard
+        line = "open the page for details"
+    return (f"<section><h2>Crypto</h2><ol class='board'><li><a class='botrow' href='/hype'>"
+            f"<span class='who'><b>Hype bot</b><span class='quiet small'>Follows Solana memecoin hype "
+            f"24/7. {esc(line)}</span></span></a></li></ol></section>")
 
 
 def leaderboard_headline(views: Sequence[BotView], now: datetime, state: Any) -> tuple[str, str]:

@@ -73,6 +73,7 @@ class AppState:
         self.controls = controls  # LiveSimulationEngine used for pause/resume
         self.scheduler = scheduler
         self.engine_note = ""
+        self.hype: Any = None  # HypeRunner for the memecoin paper bot (None when off)
         self.intraday: Any = None  # IntradayRunner, for the dashboard's "today so far"
         self._failures: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
@@ -154,10 +155,14 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
             path = self.path.split("?", 1)[0]
             if path == "/healthz":
                 return self._send(HTTPStatus.OK, "ok\n")
-            if path != "/" and not path.startswith("/bot/"):
+            if path != "/" and path != "/hype" and not path.startswith("/bot/"):
                 return self._send(HTTPStatus.NOT_FOUND, "not found\n")
             if not self._authorised():
                 return None
+            if path == "/hype":
+                from tradinglab.web.views_hype import hype_page
+
+                return self._send(HTTPStatus.OK, hype_page(state), "text/html; charset=utf-8")
             if path.startswith("/bot/"):
                 from tradinglab.web.views_bots import bot_page
 
@@ -261,6 +266,7 @@ def build_state(env: Mapping[str, str]) -> AppState:
     from tradinglab.engine.runtime import ResearchJob, build_intraday
 
     state.intraday = build_intraday(settings, state.store)
+    start_hype(state, settings, env)
 
     def extra_jobs():
         store = postgres_store(settings)
@@ -274,6 +280,30 @@ def build_state(env: Mapping[str, str]) -> AppState:
     state.scheduler = sched
     sched.start()
     return state
+
+
+def start_hype(state: AppState, settings: Any, env: Mapping[str, str]) -> None:
+    """Start the hype paper bot (24/7). HYPE_BOT=off disables it. Never blocks the stock bots."""
+    if env.get("HYPE_BOT", "on").strip().lower() in {"off", "0", "false", "no"}:
+        return
+    try:
+        from tradinglab.engine.runtime import postgres_store
+        from tradinglab.hype.bot import HypeBot, HypeRunner
+        from tradinglab.hype.dexscreener import DexScreenerClient
+        from tradinglab.hype.model import Rules
+        from tradinglab.hype.store import PgHypeStore
+
+        rules = Rules(bankroll=float(env.get("HYPE_BANKROLL", "1000")),
+                      stake=float(env.get("HYPE_STAKE", "50")))
+        store = PgHypeStore(state.store)  # page reads through the dashboard's connection
+        runner = HypeRunner(
+            lambda: HypeBot(DexScreenerClient(), PgHypeStore(postgres_store(settings)), rules))
+        runner.store, runner.rules = store, rules  # type: ignore[attr-defined]
+        state.hype = runner
+        runner.start()
+        log.info("hype paper bot started ($%.0f bankroll, $%.0f per coin)", rules.bankroll, rules.stake)
+    except Exception:  # noqa: BLE001 - the stock bots must keep running regardless
+        log.exception("hype bot failed to start")
 
 
 def serve(env: Mapping[str, str] | None = None) -> None:

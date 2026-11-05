@@ -215,6 +215,7 @@ class C_SourceCodeTests(unittest.TestCase):
         net = re.compile(r"^(urllib\.request|http\.client|requests|httpx|aiohttp|urllib3|"
                          r"websocket|websockets|socket|anthropic)(\.|$)")
         allowed = {SRC / "marketdata" / "tiingo.py": {"urllib.request"},
+                   SRC / "hype" / "dexscreener.py": {"urllib.request"},
                    SRC / "safety" / "selfcheck.py": {"socket", "urllib.request"},
                    SRC / "safety" / "network_guard.py": {"socket"},
                    SRC / "research" / "claude.py": {"anthropic"}}

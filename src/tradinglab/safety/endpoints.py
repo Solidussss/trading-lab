@@ -26,7 +26,13 @@ DATA_PROVIDER_HOST: Final = "api.tiingo.com"
 DATA_PROVIDER_URL: Final = f"https://{DATA_PROVIDER_HOST}"
 RESEARCH_HOST: Final = "api.anthropic.com"
 
-DEFAULT_ALLOWED_HOSTS: Final[frozenset[str]] = frozenset({DATA_PROVIDER_HOST, RESEARCH_HOST})
+# Read-only crypto market data for the hype paper bot (prices, volume, liquidity). DexScreener
+# is a data aggregator with no accounts, wallets or order entry; it cannot trade.
+CRYPTO_DATA_HOST: Final = "api.dexscreener.com"
+CRYPTO_DATA_URL: Final = f"https://{CRYPTO_DATA_HOST}"
+
+DEFAULT_ALLOWED_HOSTS: Final[frozenset[str]] = frozenset(
+    {DATA_PROVIDER_HOST, RESEARCH_HOST, CRYPTO_DATA_HOST})
 
 # Domains of brokerages and trading venues with order-entry APIs. Matched as the domain
 # itself or any subdomain. This list exists for clear errors and defence in depth: the
@@ -42,6 +48,12 @@ BROKERAGE_DOMAINS: Final[frozenset[str]] = frozenset(
         "bmoinvestorline.com", "cibc.com", "scotiaitrade.com", "nbdb.ca", "disnat.com",
         "coinbase.com", "kraken.com", "binance.com", "binance.us", "gemini.com",
         "bitstamp.net", "deribit.com", "bybit.com", "okx.com",
+        # Solana memecoin launchpads, swap routers, trading terminals and wallets: anything
+        # that can sign or route a swap. The hype bot only reads public market data.
+        "pump.fun", "axiom.trade", "jup.ag", "jupiter.ag", "raydium.io", "orca.so",
+        "meteora.ag", "photon-sol.tinyastro.io", "tinyastro.io", "bullx.io", "gmgn.ai",
+        "bonkbot.io", "trojanonsolana.com", "bloombot.app", "phantom.app", "solflare.com",
+        "moonshot.money", "letsbonk.fun", "padre.gg", "nova.trade",
     }
 )
 
