@@ -102,6 +102,13 @@ class RulesTest(unittest.TestCase):
         self.assertEqual(entry_check(hot(), Rules()), [])
         self.assertGreaterEqual(score(hot()), 60)
 
+    def test_feed_without_promo_data_is_not_penalised(self):
+        plain = replace(hot(), boosts=0, socials=0)
+        blind = replace(plain, promo_known=False)
+        self.assertGreater(score(blind), score(plain))
+        self.assertLessEqual(score(replace(blind, buys_5m=500, sells_5m=10, vol_5m=1e6, chg_5m=30,
+                                           liquidity=1e6)), 100)
+
     def test_filters(self):
         r = Rules()
         self.assertTrue(any("thin pool" in x for x in entry_check(hot(liq=5000), r)))

@@ -204,6 +204,15 @@ class HypeBot:
                               "buy_ratio": round(s.buy_ratio, 3), "vol_accel": round(s.vol_accel, 2),
                               "bought": can_buy, "why_not": no[:3]})
         acct.watch = watch
+        if acct.cycles % 20 == 1:  # every ~10 min: what it saw and why it passed
+            reasons: dict[str, int] = {}
+            for s in ranked:
+                for r in entry_check(s, self.rules):
+                    key = r.split(" (")[0]
+                    reasons[key] = reasons.get(key, 0) + 1
+            top = ", ".join(f"{k} x{n}" for k, n in sorted(reasons.items(), key=lambda kv: -kv[1])[:5])
+            log.info("hype scan: %d coins, %d bought, best score %.0f; skipped for: %s", len(ranked),
+                     bought, score(ranked[0]) if ranked else 0, top or "-")
 
     def _buy(self, acct: Account, s: Snapshot, now: datetime) -> None:
         stake = self.rules.stake

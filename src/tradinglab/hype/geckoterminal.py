@@ -74,7 +74,7 @@ def parse_pool(pool: dict, tokens: dict[str, dict], now_ms: int) -> Snapshot | N
         buys_1h=int(_f(h1.get("buys")) or 0), sells_1h=int(_f(h1.get("sells")) or 0),
         vol_5m=_f(vol.get("m5")) or 0.0, vol_1h=_f(vol.get("h1")) or 0.0,
         chg_5m=_f(chg.get("m5")) or 0.0, chg_1h=_f(chg.get("h1")) or 0.0,
-        boosts=0, socials=0)
+        boosts=0, socials=0, promo_known=False)
 
 
 class GeckoTerminalClient:

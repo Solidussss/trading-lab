@@ -225,22 +225,38 @@ def leaderboard_page(state: Any, now: datetime | None = None) -> str:
 
 
 def hype_link(state: Any) -> str:
-    """A card linking to the 24/7 Solana memecoin hype paper bot, with its running total."""
+    """The 24/7 Solana memecoin hype paper bot, laid out like a leaderboard row."""
     runner = getattr(state, "hype", None)
     if runner is None or getattr(runner, "store", None) is None:
         return ""
     try:
         from tradinglab.hype.bot import equity
 
+        rules = runner.rules
         acct = runner.store.load_hype()
-        total = equity(acct, runner.rules) - runner.rules.bankroll if acct else 0.0
-        line = (f"{signed(total)} on a pretend {money(runner.rules.bankroll, False)}, "
-                f"{len(acct.positions) if acct else 0} coins held")
+        value = equity(acct, rules) if acct else rules.bankroll
+        total = value - rules.bankroll
+        n, wins, _, _, _ = runner.store.hype_stats()
+        held = len(acct.positions) if acct else 0
+        if acct and acct.last_error:
+            status = "Data feed busy, retrying"
+        elif acct and acct.last_cycle:
+            status = (f"Holding {held} coin{'s' if held != 1 else ''}" if held
+                      else "Scanning for hype, nothing worth buying yet")
+        else:
+            status = "Starting up"
+        wr = f"{wins / n:.0%} of {n} trades won" if n else "No trades yet"
+        nums = (f"<span class='nums'><b class='val'>{money(value, False)}</b>"
+                f"<span class='{tone_usd(total)} small nw'>{signed(total, False)} total</span>"
+                f"<span class='small nw'>{held} open</span>"
+                f"<span class='quiet small nw'>{esc(wr)}</span></span>")
     except Exception:  # noqa: BLE001 - never break the leaderboard
-        line = "open the page for details"
+        status, nums = "Open the page for details", "<span class='nums'></span>"
     return (f"<section><h2>Crypto</h2><ol class='board'><li><a class='botrow' href='/hype'>"
-            f"<span class='who'><b>Hype bot</b><span class='quiet small'>Follows Solana memecoin hype "
-            f"24/7. {esc(line)}</span></span></a></li></ol></section>")
+            f"<span class='rank'>&#9678;</span>"
+            f"<span class='who'><b>Hype bot</b><span class='quiet small'>Buys Solana memecoins while "
+            f"the hype is building, 24/7. {money(runner.rules.stake, False)} a coin.</span>"
+            f"<span class='small status-line'>{esc(status)}</span></span>{nums}</a></li></ol></section>")
 
 
 def leaderboard_headline(views: Sequence[BotView], now: datetime, state: Any) -> tuple[str, str]:

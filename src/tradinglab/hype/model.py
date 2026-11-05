@@ -39,6 +39,7 @@ class Snapshot:
     chg_1h: float
     boosts: int
     socials: int
+    promo_known: bool = True  # False when the feed has no boost/social data (GeckoTerminal)
 
     @property
     def buy_ratio(self) -> float:
@@ -68,7 +69,7 @@ class Rules:
     min_vol_accel: float = 1.8
     min_chg_5m: float = 3.0
     max_chg_5m: float = 45.0  # don't buy a candle that already went vertical
-    min_score: float = 60.0
+    min_score: float = 50.0  # ranking cut-off; the hard rules above already define hype
     cooldown_hours: float = 6.0
     # exits
     stop_loss: float = -0.25
@@ -94,8 +95,12 @@ def score(s: Snapshot) -> float:
     surge = min(max((s.vol_accel - 1.0) / 3.0, 0.0), 1.0) * 25
     momentum = min(max(s.chg_5m / 20.0, 0.0), 1.0) * 10 + (5 if s.chg_1h > 0 else 0)
     promo = min(s.boosts / 10.0, 1.0) * 10
-    depth = min(s.liquidity / 100_000.0, 1.0) * 5 + min(s.socials, 3) / 3 * 5
-    return round(pressure + activity + surge + momentum + promo + depth, 1)
+    socials = min(s.socials, 3) / 3 * 5
+    depth = min(s.liquidity / 100_000.0, 1.0) * 5
+    raw = pressure + activity + surge + momentum + promo + depth + socials
+    if not s.promo_known:  # don't punish a coin because the feed can't see its promotion
+        raw = raw / 85 * 100
+    return round(raw, 1)
 
 
 def entry_check(s: Snapshot, rules: Rules) -> list[str]:
