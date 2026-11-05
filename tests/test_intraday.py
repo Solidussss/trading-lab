@@ -17,6 +17,8 @@ from tradinglab.intraday.strategies import (
     FairValueGap,
     GapFill,
     IntradayStrategy,
+    LateDayMomentum,
+    NoiseBreakout,
     OpeningRangeBreakout,
     StrategyContext,
     VwapDip,
@@ -236,14 +238,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(BotState.from_dict(st.to_dict() | {"future_field": 1}), st)
 
 
-def ctx_for(bars, sym="SPY", prev=None, pos=None, entries=0):
+def ctx_for(bars, sym="SPY", prev=None, pos=None, entries=0, history=()):
     s = session(bars[0].day)
-    return StrategyContext(sym, bars[0].day, bars, prev, pos, entries, s.open_utc, s.close_utc)
+    return StrategyContext(sym, bars[0].day, bars, prev, pos, entries, s.open_utc, s.close_utc,
+                           history=history)
 
 
 class StrategyTests(unittest.TestCase):
-    def test_registry_has_four_plain_english_strategies(self):
-        self.assertEqual(set(REGISTRY), {"orb", "gap", "vwap_dip", "vwap_trend", "fvg"})
+    def test_registry_has_plain_english_strategies(self):
+        self.assertEqual(set(REGISTRY), {"orb", "gap", "vwap_dip", "vwap_trend", "fvg", "noise",
+                                         "late_momentum"})
         for cls in REGISTRY.values():
             self.assertTrue(cls.name and cls.summary and cls.rules)
         with self.assertRaises(ValueError):
@@ -294,6 +298,71 @@ class StrategyTests(unittest.TestCase):
         last = bars[-1]
         bars[-1] = IBar(last.ts, vw + 0.02, vw + 0.2, vw - 0.01, vw + 0.1, 1000.0)
         self.assertIsInstance(VwapTrend().on_bar(ctx_for(bars)), Enter)
+
+
+def wiggly_history(n=14, end=DAY, move=0.002):
+    """n earlier sessions where each bar closes `move` away from the day's open (alternating)."""
+    days = [d for d in trading_days(end - timedelta(days=40), end) if d < end][-n:]
+    out = []
+    for d in days:
+        bars = day_bars(day=d)
+        out.append([IBar(b.ts, 100.0, 100.3, 99.7, 100.0 * (1 + move * (1 if i % 2 else -1)),
+                         1000.0) for i, b in enumerate(bars)])
+    return out
+
+
+class EvidenceStrategyTests(unittest.TestCase):
+    def test_late_day_momentum_buys_the_last_half_hour_only_after_an_up_morning(self):
+        up = day_bars(overrides={"09:55": (100.0, 100.6, 100.0, 100.5)})
+        core = IntradayCore(LateDayMomentum(), ["SPY"], RiskParams(), INTRADAY_COSTS)
+        res = core.run_day(BotState.initial(100_000.0, DAY), DAY, {"SPY": up}, {"SPY": 100.0})
+        self.assertEqual(len(res.trades), 1)
+        t = res.trades[0]
+        self.assertEqual((t.entry_ts, t.exit_reason), (at(DAY, "15:30"), "end_of_day"))
+        self.assertAlmostEqual(t.shares * t.entry_price / 100_000, 0.098, places=2)  # ~10% each
+        down = day_bars(overrides={"09:55": (100.0, 100.0, 99.4, 99.5)})
+        res = core.run_day(BotState.initial(100_000.0, DAY), DAY, {"SPY": down}, {"SPY": 100.0})
+        self.assertEqual(res.trades, [])
+
+    def test_noise_breakout_needs_history_and_trades_only_on_half_hour_checks(self):
+        ramp = {f"{9 + (30 + 5 * i) // 60:02d}:{(30 + 5 * i) % 60:02d}":
+                (100 + 0.1 * i, 100.15 + 0.1 * i, 99.95 + 0.1 * i, 100.1 + 0.1 * i) for i in range(6)}
+        bars = day_bars(price=100.6, overrides=ramp)  # up 0.6% by 10 am, then holds
+        s = NoiseBreakout()
+        sig = [(b.ny_time, s.on_bar(ctx_for(bars[: i + 1], prev=100.0, history=wiggly_history())))
+               for i, b in enumerate(bars[:12])]
+        hits = [(t, x) for t, x in sig if x]
+        self.assertEqual([t for t, _ in hits], ["09:55", "10:25"])  # bars ending 10:00, 10:30
+        self.assertIsInstance(hits[0][1], Enter)
+        self.assertAlmostEqual(hits[0][1].diagnostics["noise"], 0.002)
+        self.assertIsNone(NoiseBreakout().on_bar(ctx_for(bars[:6], prev=100.0)))  # no history
+        quiet = day_bars(price=100.1)  # inside the noise all day
+        self.assertFalse(any(NoiseBreakout().on_bar(ctx_for(quiet[: i + 1], prev=100.0,
+                                                            history=wiggly_history()))
+                             for i in range(len(quiet))))
+        falls = [b if b.ny_time < "10:00" else IBar(b.ts, 100.0, 100.05, 99.9, 100.0, 1000.0)
+                 for b in bars]
+        ex = NoiseBreakout().on_bar(ctx_for(falls[:12], prev=100.0, pos=100.6,
+                                            history=wiggly_history()))
+        self.assertIsInstance(ex, Exit)  # back inside the noise at the 10:30 check
+
+    def test_live_and_history_test_feed_the_same_earlier_sessions(self):
+        feed = FakeFeed()
+        r, store = runner_with(feed, bots=[BotSpec("noise", "noise")])
+        r.run(datetime(2024, 3, 2, 18, tzinfo=UTC))
+        days = trading_days(date(2024, 3, 4), date(2024, 3, 28))
+        for d in days:
+            r.run(at(d, "16:30"))
+        core = IntradayCore(NoiseBreakout(), SYMS, r.risk, INTRADAY_COSTS)
+        st = BotState.initial(r.capital, date(2024, 3, 4))
+        past = {s: [feed.data[s][date(2024, 3, 1)]] for s in SYMS}  # loaded as "yesterday"
+        for d in days:
+            hist = {s: past[s][-14:] for s in SYMS}
+            self.assertEqual(r.history(BotSpec("noise", "noise"), d), hist)
+            core.run_day(st, d, {s: feed.data[s][d] for s in SYMS}, r.prev_closes(d), history=hist)
+            for s in SYMS:
+                past[s].append(feed.data[s][d])
+        self.assertAlmostEqual(store.load_bot("noise").cash, st.cash)
 
 
 class FairValueGapTests(unittest.TestCase):

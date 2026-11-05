@@ -43,6 +43,7 @@ from tradinglab.marketdata.intraday import (
     coverage,
     detect_end_labelled,
     parse_iex_rows,
+    split_by_day,
 )
 
 log = logging.getLogger(__name__)
@@ -171,6 +172,21 @@ class IntradayRunner:
             out[sym] = bars[-1].close if bars else self.store.official_close(sym, prev)
         return out
 
+    def history(self, bot: BotSpec, day: date) -> dict[str, list[list[IBar]]] | None:
+        """The sessions before `day` a strategy asks for (history_days), oldest first. Same
+        rule as the history test: only sessions that have bars."""
+        n = bot.strategy().history_days
+        if not n:
+            return None
+        start = day
+        for _ in range(n + 5):  # a few spare sessions in case some have no data
+            start = previous_trading_day(start)
+        out = {}
+        for sym in self.symbols:
+            by_day = split_by_day(self.store.ibars(sym, start, previous_trading_day(day)))
+            out[sym] = [by_day[d] for d in sorted(by_day) if d < day and by_day[d]][-n:]
+        return out
+
     def pause_fn(self) -> Callable[[datetime], bool]:
         return lambda ts: self.store.flag_at("paused", ts)
 
@@ -210,7 +226,8 @@ class IntradayRunner:
                 if day not in self._days_due(st, target):
                     continue
                 result = self.core(bot).run_day(st, day, bars, prev, final=True,
-                                                paused=self.pause_fn())
+                                                paused=self.pause_fn(),
+                                                history=self.history(bot, day))
                 self.store.commit_bot_day(bot.id, st, result)
                 report.committed.append((bot.id, day))
             report.status = "committed"
@@ -282,7 +299,8 @@ class IntradayRunner:
             return None
         bars = {s: [b for b in self.store.ibars(s, day) if b.end <= now] for s in self.symbols}
         return self.core(bot).run_day(copy.deepcopy(st), day, bars, self.prev_closes(day),
-                                      final=now >= session(day).close_utc, paused=self.pause_fn())
+                                      final=now >= session(day).close_utc, paused=self.pause_fn(),
+                                      history=self.history(bot, day))
 
     def _event(self, now: datetime, day: date | None, kind: str, detail: str) -> None:
         self.store.add_event(EngineEvent(now, day, kind, detail))

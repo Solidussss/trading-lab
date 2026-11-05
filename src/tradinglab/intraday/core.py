@@ -196,7 +196,8 @@ class IntradayCore:
 
     def run_day(self, state: BotState, day: date, bars: Mapping[str, Sequence[IBar]],
                 prev_close: Mapping[str, float | None], *, final: bool = True,
-                paused: bool | Callable[[datetime], bool] = False) -> DayResult:
+                paused: bool | Callable[[datetime], bool] = False,
+                history: Mapping[str, Sequence[Sequence[IBar]]] | None = None) -> DayResult:
         """Simulate `day`. With final=True, `state` is advanced (positions closed at the close);
         with final=False (today, still trading) nothing is mutated and open positions are
         marked at their latest price."""
@@ -337,7 +338,8 @@ class IntradayCore:
                                                    f"{rest.reason}; {gone}"))
                 ctx = StrategyContext(sym, day, seen[sym], prev_close.get(sym),
                                       positions[sym].entry_price if sym in positions else None,
-                                      entries[sym], sess.open_utc, sess.close_utc, stats[sym])
+                                      entries[sym], sess.open_utc, sess.close_utc, stats[sym],
+                                      (history or {}).get(sym, ()))
                 sig = self.strategy.on_bar(ctx)
                 if sig is None:
                     continue

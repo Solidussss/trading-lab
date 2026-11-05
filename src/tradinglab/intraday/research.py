@@ -195,6 +195,8 @@ def run_history_test(store, bots: Sequence[BotSpec], symbols: Sequence[str], ris
         stop_at = VALIDATION.end if sealed else test.end
         st = BotState.initial(capital, first)
         days, trades = [], []
+        n_hist = core.strategy.history_days
+        past: dict[str, list] = {s: [] for s in symbols}  # earlier sessions, oldest first
         for d in trading_days(first, stop_at):
             day_bars = {s: bars[s].get(d, []) for s in symbols}
             if not any(day_bars.values()):
@@ -202,7 +204,12 @@ def run_history_test(store, bots: Sequence[BotSpec], symbols: Sequence[str], ris
             pd = previous_trading_day(d)
             prev = {s: bars[s][pd][-1].close if bars[s].get(pd) else closes[s].get(pd)
                     for s in symbols}  # same rule as live (IntradayRunner.prev_closes)
-            r = core.run_day(st, d, day_bars, prev, final=True)
+            hist = {s: past[s][-n_hist:] for s in symbols} if n_hist else None
+            r = core.run_day(st, d, day_bars, prev, final=True, history=hist)
+            if n_hist:
+                for s in symbols:
+                    if day_bars[s]:
+                        past[s] = (past[s] + [day_bars[s]])[-n_hist:]
             days.append((d, r.start_equity, r.end_equity))
             trades.extend(r.trades)
         spy = closes.get("SPY", {})

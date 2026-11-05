@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar
 
-from tradinglab.marketdata.calendar import NY
+from tradinglab.marketdata.calendar import NY, session
 from tradinglab.marketdata.intraday import IBar
 
 
@@ -76,6 +76,7 @@ class StrategyContext:
     open_utc: datetime
     close_utc: datetime
     stats: RunningStats | None = None
+    history: Sequence[Sequence[IBar]] = ()  # earlier sessions' bars, oldest first (if asked for)
 
     def _stats(self) -> RunningStats:
         if self.stats is not None:
@@ -114,6 +115,7 @@ class IntradayStrategy:
     summary: ClassVar[str] = ""  # one plain-English sentence for the dashboard
     rules: ClassVar[tuple[str, ...]] = ()  # plain-English rules for "how it works"
     max_entries_per_symbol: ClassVar[int] = 1
+    history_days: ClassVar[int] = 0  # earlier sessions of 5-minute bars this strategy needs
     defaults: ClassVar[dict[str, float]] = {}
 
     def __init__(self, **params: float) -> None:
@@ -312,8 +314,121 @@ class FairValueGap(IntradayStrategy):
                      diagnostics={"gap_bottom": bottom, "gap_top": top, "entry": entry})
 
 
+class NoiseBreakout(IntradayStrategy):
+    """Intraday momentum past the "noise area", after Zarattini, Aziz and Barbon (2024), "Beat
+    the Market: An effective intraday momentum strategy for the S&P 500 ETF (SPY)".
+
+    For each time of day, the noise is the average distance the fund was from that day's open
+    at that time over the last 14 sessions. The upper edge is max(today's open, yesterday's
+    close) x (1 + noise). Checked only every 30 minutes, from 10 am: buy when the price closes
+    above both the upper edge and VWAP; sell at a later check when it closes back below either
+    one (the paper's trailing stop). Long-only here, and sized by the shared risk rules instead
+    of the paper's volatility targeting and leverage. Parameters are the paper's, not tuned.
+    """
+
+    id = "noise"
+    name = "Breakout past normal noise"
+    summary = ("Learns how far each fund normally drifts from its open at each time of day, and "
+               "buys only when today's climb is clearly bigger than that normal noise.")
+    rules = ("For every time of day, works out how far the fund usually is from its open, "
+             "averaged over the last 14 trading days. Anything inside that is 'noise'.",
+             "Checks every 30 minutes from 10 am. Buys when the price closes above the top of "
+             "the noise (measured from the higher of today's open and yesterday's close) and "
+             "above the day's average price (VWAP).",
+             "At each later check, sells if the price has dropped back below either line.",
+             "Sells at the close at the latest. Emergency stop 5% down, which also sizes each "
+             "fund to about a tenth of the account, so all three can be held at once. Up to two "
+             "trades per fund a day.")
+    max_entries_per_symbol = 2
+    history_days = 14
+    defaults = {"lookback": 14, "min_days": 10, "start_minutes": 30, "every_minutes": 30,
+                "disaster_stop": 0.05}
+
+    def __init__(self, **params: float) -> None:
+        super().__init__(**params)
+        self._noise: dict[tuple[str, date], dict[int, float]] = {}
+
+    def noise(self, ctx: StrategyContext) -> dict[int, float]:
+        """Average |price / day's open - 1| by minutes after the open, over earlier sessions."""
+        key = (ctx.symbol, ctx.day)
+        if key not in self._noise:
+            if len(self._noise) > 16:
+                self._noise.clear()
+            sums: dict[int, float] = {}
+            counts: dict[int, int] = {}
+            for bars in list(ctx.history)[-int(self.params["lookback"]):]:
+                if not bars:
+                    continue
+                opened = session(bars[0].day).open_utc
+                if bars[0].ts != opened or bars[0].open <= 0:
+                    continue  # no real opening bar: that day's distances would be wrong
+                for b in bars:
+                    k = round((b.end - opened).total_seconds() / 60)
+                    sums[k] = sums.get(k, 0.0) + abs(b.close / bars[0].open - 1)
+                    counts[k] = counts.get(k, 0) + 1
+            self._noise[key] = {k: sums[k] / counts[k] for k in sums
+                                if counts[k] >= self.params["min_days"]}
+        return self._noise[key]
+
+    def on_bar(self, ctx: StrategyContext) -> Signal | None:
+        p = self.params
+        k = round(ctx.minutes_since_open())
+        if k < p["start_minutes"] or k % int(p["every_minutes"]):
+            return None
+        if not ctx.prev_close or ctx.bars[0].ts != ctx.open_utc:
+            return None
+        sigma = self.noise(ctx).get(k)
+        if not sigma:
+            return None
+        b = ctx.bar
+        upper = max(ctx.bars[0].open, ctx.prev_close) * (1 + sigma)
+        vwap = ctx.vwap_series()[-1]
+        line = max(upper, vwap)
+        diag = {"noise": sigma, "upper": upper, "vwap": vwap, "close": b.close}
+        if ctx.position_entry is not None:
+            return Exit("back_inside_noise", diag) if b.close < line else None
+        if b.close > line:
+            return Enter(b.close * (1 - p["disaster_stop"]), "broke_above_noise", diagnostics=diag)
+        return None
+
+
+class LateDayMomentum(IntradayStrategy):
+    """Market intraday momentum, after Gao, Han, Li and Zhou (2018), "Market intraday
+    momentum", Journal of Financial Economics 129(2). The return from yesterday's close to
+    10 am predicts the return of the last half hour. Long-only: buy for the last 30 minutes
+    when the first-half-hour return is positive. Parameters are the paper's, not tuned."""
+
+    id = "late_momentum"
+    name = "Last half-hour momentum"
+    summary = ("When a fund is up from yesterday's close by 10 am, buys it for the last half "
+               "hour of the day, when that early move tends to continue.")
+    rules = ("At 10 am, notes whether the fund is above or below yesterday's close.",
+             "If it was above, buys at 3:30 pm (30 minutes before the close).",
+             "Sells at the close. One trade per fund a day, so costs stay low.",
+             "Emergency stop 5% down, which also sizes each fund to about a tenth of the "
+             "account, so all three can be held at once.")
+    defaults = {"first_minutes": 30, "last_minutes": 30, "disaster_stop": 0.05}
+
+    def on_bar(self, ctx: StrategyContext) -> Signal | None:
+        p = self.params
+        if ctx.position_entry is not None or ctx.entries_today or not ctx.prev_close:
+            return None
+        if ctx.bar.end != ctx.close_utc - timedelta(minutes=p["last_minutes"]):
+            return None
+        mark = ctx.open_utc + timedelta(minutes=p["first_minutes"])
+        early = [b for b in ctx.bars if b.end == mark]
+        if not early:
+            return None
+        first = early[0].close / ctx.prev_close - 1
+        if first <= 0:
+            return None
+        return Enter(ctx.bar.close * (1 - p["disaster_stop"]), "up_by_10am",
+                     diagnostics={"first_half_hour": first, "close": ctx.bar.close})
+
+
 REGISTRY: dict[str, type[IntradayStrategy]] = {
-    cls.id: cls for cls in (OpeningRangeBreakout, GapFill, VwapDip, VwapTrend, FairValueGap)
+    cls.id: cls for cls in (OpeningRangeBreakout, GapFill, VwapDip, VwapTrend, FairValueGap,
+                             NoiseBreakout, LateDayMomentum)
 }
 
 
