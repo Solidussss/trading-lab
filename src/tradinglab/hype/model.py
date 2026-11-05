@@ -165,6 +165,7 @@ class Position:
     half_taken: bool = False
     pair: str = ""  # the pool it's priced from (survives restarts)
     missing: int = 0  # consecutive checks with no data for this pool
+    trail: list[float] = field(default_factory=list)  # recent prices, for the card's mini chart
 
     def gain(self, price: float | None = None) -> float:
         p = self.last if price is None else price
@@ -199,6 +200,7 @@ class Account:
     last_cycle: str = ""
     last_error: str = ""
     cycles: int = 0
+    curve: list[list] = field(default_factory=list)  # [[iso time, portfolio value], ...]
 
     def to_json(self) -> dict:
         return asdict(self)

@@ -31,6 +31,9 @@ from tradinglab.hype.model import (
 log = logging.getLogger(__name__)
 
 CYCLE_SECONDS = 30
+CURVE_EVERY_MIN = 5  # one portfolio-value point per 5 minutes...
+CURVE_POINTS = 2016  # ...kept for 7 days
+TRAIL_POINTS = 60  # last 60 prices per open coin (~30 min)
 SCAN_EVERY = 2  # look for new coins every 2nd cycle (~1 min); open positions every cycle
 WATCH_SIZE = 12
 
@@ -126,6 +129,9 @@ class HypeBot:
             log.warning("hype cycle failed: %s", exc)
             acct.last_error = f"{type(exc).__name__}: {exc}"[:300]
         acct.last_cycle = _iso(now)
+        last = datetime.fromisoformat(acct.curve[-1][0]) if acct.curve else None
+        if last is None or now - last >= timedelta(minutes=CURVE_EVERY_MIN):
+            acct.curve = (acct.curve + [[_iso(now), round(equity(acct, self.rules), 2)]])[-CURVE_POINTS:]
         self.store.save_hype(acct, closed)
         return acct
 
@@ -146,6 +152,7 @@ class HypeBot:
                     continue
             else:
                 p.missing = 0
+                p.trail = (p.trail + [s.price])[-TRAIL_POINTS:]
                 p.last, p.last_liquidity = s.price, s.liquidity
                 p.peak = max(p.peak, s.price)
                 if not p.half_taken and p.gain() >= self.rules.take_half_at:
@@ -207,7 +214,8 @@ class HypeBot:
         acct.positions.append(Position(
             token=s.token, symbol=s.symbol, url=s.url, opened=_iso(now), stake=stake, qty=qty,
             entry_price=eff, seen_price=s.price, entry_liquidity=s.liquidity, entry_score=score(s),
-            why=why, peak=s.price, last=s.price, last_liquidity=s.liquidity, pair=s.pair))
+            why=why, peak=s.price, last=s.price, last_liquidity=s.liquidity, pair=s.pair,
+            trail=[s.price]))
         log.info("hype: bought %s for $%.0f (%s)", s.symbol, stake, why)
 
 
