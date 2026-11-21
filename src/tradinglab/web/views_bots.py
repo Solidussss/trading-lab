@@ -555,6 +555,14 @@ def health_card(state: Any) -> str:
         row("warn" if st.get("last_error") else "", "Phone alerts (Discord)",
             f"last message failed ({st['last_error']})" if st.get("last_error") else
             ("on" if st.get("last_ok") else "on, nothing sent yet"))
+    watch = getattr(state, "traders", None)
+    if watch is None:
+        row("off", "Trader watch (Solana)", "off")
+    else:
+        st = watch.status()
+        row("warn" if st.get("error") else "", "Trader watch (Solana)",
+            f"trouble reading the blockchain ({st['error']})" if st.get("error") else
+            (f"watching {st.get('wallets', 0)} wallets" if st.get("ok") else "starting"))
     row("", "Database", "ok")
     if sched is not None and sched.status.last_check:
         row("", "Last check", time_label(sched.status.last_check, state.tz))

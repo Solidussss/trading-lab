@@ -22,6 +22,7 @@ from tradinglab.hype.bot import (
 )
 from tradinglab.hype.dexscreener import DexScreenerClient, MarketDataError, parse_pair
 from tradinglab.hype.feeds import DISCOVER_TTL, PRICE_TTL, RATE_LIMIT_PAUSE, SharedFeed
+from tradinglab.hype.known_traders import KNOWN as KNOWN_TRADERS
 from tradinglab.hype.model import (
     VARIANTS,
     Account,
@@ -907,11 +908,13 @@ class StartHypeTest(unittest.TestCase):
                            lambda pg, account="current": stores.setdefault(account, MemoryHypeStore())), \
                 mock.patch("tradinglab.hype.geckoterminal.GeckoTerminalClient", lambda: gecko), \
                 mock.patch("tradinglab.hype.dexscreener.DexScreenerClient", lambda: dex):
-            server.start_hype(state, None, {"HYPE_BANKROLL": "500", "HYPE_STAKE": "20"})
+            server.start_hype(state, None, {"HYPE_BANKROLL": "500", "HYPE_STAKE": "20",
+                                            "TRADER_WATCH": "off"})
             runner = state.hype
             runner.run_once()
             runner.run_once()
         self.assertEqual(runner.error, "")
+        self.assertIsNone(state.traders)
         self.assertEqual([v.id for v, _ in runner.variants], [v.id for v in VARIANTS])
         for (v, store), base in zip(runner.variants, VARIANTS, strict=True):
             self.assertEqual(v.rules, replace(base.rules, bankroll=500.0, stake=20.0))
@@ -925,6 +928,25 @@ class StartHypeTest(unittest.TestCase):
         self.assertEqual((gecko.discovers, dex.discovers), (1, 1))
         self.assertEqual((dex.price_calls, gecko.price_calls), ([["TokA1"]], []))  # prices: DexScreener first
         self.assertEqual(runner.feed_status()["rate_limited_1h"], 0)
+
+    def test_the_trader_watch_starts_once_and_is_handed_to_the_scout(self):
+        from tradinglab.hype.traders import TraderFeed
+        from tradinglab.web import server
+
+        gecko, dex = counting("TokA1"), counting("TokA1")
+        state = SimpleNamespace(store=object(), hype=None)
+        with mock.patch.object(HypeRunner, "start"), mock.patch.object(TraderFeed, "start") as started, \
+                mock.patch("tradinglab.engine.runtime.postgres_store", return_value=object()), \
+                mock.patch("tradinglab.hype.store.PgHypeStore", lambda pg, account="current": MemoryHypeStore()), \
+                mock.patch("tradinglab.hype.geckoterminal.GeckoTerminalClient", lambda: gecko), \
+                mock.patch("tradinglab.hype.dexscreener.DexScreenerClient", lambda: dex):
+            server.start_hype(state, None, {})
+            state.hype.run_once()
+            state.hype.run_once()
+        started.assert_called_once_with()  # the thread itself never runs in a test
+        self.assertIsInstance(state.traders, TraderFeed)
+        self.assertIs(state.hype.scout.traders, state.traders)
+        self.assertEqual(state.traders.status()["wallets"], len(KNOWN_TRADERS))  # the scout told it who
 
     def test_hype_bot_can_be_switched_off(self):
         from tradinglab.web import server

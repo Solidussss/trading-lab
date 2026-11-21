@@ -9,6 +9,11 @@ new pools) and raises an alert when it sees one of these:
   theme      several new coins about the same thing (a subject is trending, not just one coin)
   whales     several big wallets buying a coin, with little big selling against them
   smart      a wallet with a good record here bought something
+  trader     a followed trader with a good record here bought something
+  crowd      two or more followed traders bought the same coin within half an hour
+
+The last two come from watching the wallets of known good traders, and of any wallet that
+earned a good record here, directly on the blockchain (hype/traders.py, hype/chain.py).
 
 Wallet records are built by the scout itself: every big buy it sees is remembered, and an hour
 later it checks whether the coin went up. A wallet earns "good record" only after five such
@@ -51,6 +56,8 @@ SMART_MIN_BUYS, SMART_MIN_RATE = 5, 0.6
 WHALE_LOOKUPS = 1  # coins per minute whose big trades are looked up: the data is tightly
 # rate-limited (it answered "slow down" after a handful of calls in testing)
 WHALE_WINDOW_MIN, WHALE_BUYERS, WHALE_RATIO = 10.0, 3, 2.0
+# what the kind of alert adds to a coin's own score: who is buying counts for more than a chart
+KIND_BONUS = {"smart": 25, "whales": 20, "trader": 25, "crowd": 25}
 
 # early: still on the curve, old enough to judge, busy, more buying than selling
 EARLY_AGE_MIN, EARLY_AGE_MAX = 5.0, 180.0
@@ -145,9 +152,10 @@ class Scout:
 
     def __init__(self, feed: Any, store: Any,
                  clock: Callable[[], datetime] = lambda: datetime.now(UTC),
-                 notifier: Any = None, tz: Any = UTC) -> None:
+                 notifier: Any = None, tz: Any = UTC, traders: Any = None) -> None:
         self.feed, self.store, self.clock = feed, store, clock
         self.notifier, self.tz = notifier, tz  # phone alerts (hype/notify.py); None = off
+        self.traders = traders  # the followed-wallet watch (hype/traders.py); None = off
 
     # -- state ----------------------------------------------------------------------------
 
@@ -222,6 +230,8 @@ class Scout:
         self._judge(doc, now)
         if doc.get("steps", 0) % 5 == 0:
             self._follow(doc, now)
+        if self.traders is not None:
+            self._traders(doc, now)
 
     @staticmethod
     def _safely(call: Callable[[], list]) -> list:
@@ -250,8 +260,7 @@ class Scout:
             if verdict is not None:
                 safety = verdict.to_json()
                 bonus += -10.0 if verdict.warnings else 5.0
-        grade = round(min(max(score(s) * 0.8 + bonus + {"smart": 25, "whales": 20}.get(kind, 0), 0.0),
-                          100.0), 1)
+        grade = round(min(max(score(s) * 0.8 + bonus + KIND_BONUS.get(kind, 0), 0.0), 100.0), 1)
         doc["alerts"] = ([{
             "at": _iso(now), "kind": kind, "token": s.token, "pair": s.pair, "symbol": s.symbol,
             "title": title or s.symbol, "text": text, "score": grade, "price": s.price,
@@ -315,6 +324,31 @@ class Scout:
     def smart_wallets(doc: dict) -> set[str]:
         return {w for w, r in doc.get("wallets", {}).items()
                 if r[0] >= SMART_MIN_BUYS and r[1] / r[0] >= SMART_MIN_RATE}
+
+    # -- followed traders -----------------------------------------------------------------
+
+    def _traders(self, doc: dict, now: datetime) -> None:
+        """Collect what the followed wallets did since the last look (hype/traders.py), and
+        tell the watch who to follow now. Its own failure never costs the rest of the look."""
+        from tradinglab.hype import traders as tr
+
+        book = doc.setdefault("traders", {})
+        try:
+            proven = self.smart_wallets(doc)
+            best = sorted(((w, doc["wallets"][w]) for w in proven),
+                          key=lambda kv: (kv[1][1] / kv[1][0], kv[1][0]), reverse=True)
+            names = tr.followed(best)
+            self.traders.follow(names)
+            tr.process(doc, now, self.traders.drain(), names, proven,
+                       lambda tokens: self.feed.snapshots(tokens), self._raise, links)
+            book["error"] = ""
+        except Exception as exc:  # noqa: BLE001
+            log.warning("scout: followed traders: %s: %s", type(exc).__name__, exc)
+            book["error"] = f"{type(exc).__name__}: {exc}"[:200]
+        st = self.traders.status()
+        book["watch"] = {"wallets": st.get("wallets", 0), "node": st.get("node", ""),
+                         "problem": st.get("error", ""), "flooded": list(st.get("flooded", [])),
+                         "ok": _iso(datetime.fromtimestamp(st["ok"], UTC)) if st.get("ok") else ""}
 
     # -- phone alerts ---------------------------------------------------------------------
 

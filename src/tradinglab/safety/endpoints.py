@@ -7,7 +7,8 @@ market data. The egress policy makes that structural rather than a convention:
     BrokerageForbiddenError, even if someone adds it to the allowlist by mistake.
   * ALLOW only: the market-data provider (api.tiingo.com), the Claude API
     (api.anthropic.com), three read-only crypto data services (DexScreener, GeckoTerminal,
-    RugCheck), the configured PostgreSQL host, and loopback/private addresses.
+    RugCheck), two public Solana nodes that are only ever asked to read (see below), the
+    configured PostgreSQL host, and loopback/private addresses.
   * Everything else raises EgressDeniedError (fail closed), including hosts we have never
     heard of and public IP literals (which cannot be checked against a hostname list).
 
@@ -40,8 +41,19 @@ POOL_DATA_URL: Final = f"https://{POOL_DATA_HOST}"
 RUG_REPORT_HOST: Final = "api.rugcheck.xyz"
 RUG_REPORT_URL: Final = f"https://{RUG_REPORT_HOST}"
 
+# Public Solana nodes, for reading what followed wallets bought and sold (hype/chain.py): the
+# Solana Foundation's own, and one public fallback. A node is not a trading site: it holds no
+# accounts and no funds. It would accept a transaction that someone had already signed, but
+# signing needs a wallet's private key and this program has none, builds no transactions, and
+# its one client refuses every request except two reads (tests/test_traders.py).
+CHAIN_READ_HOST: Final = "api.mainnet-beta.solana.com"
+CHAIN_READ_FALLBACK_HOST: Final = "solana-rpc.publicnode.com"
+CHAIN_READ_URLS: Final[tuple[str, ...]] = (f"https://{CHAIN_READ_HOST}",
+                                           f"https://{CHAIN_READ_FALLBACK_HOST}")
+
 DEFAULT_ALLOWED_HOSTS: Final[frozenset[str]] = frozenset(
-    {DATA_PROVIDER_HOST, RESEARCH_HOST, CRYPTO_DATA_HOST, POOL_DATA_HOST, RUG_REPORT_HOST})
+    {DATA_PROVIDER_HOST, RESEARCH_HOST, CRYPTO_DATA_HOST, POOL_DATA_HOST, RUG_REPORT_HOST,
+     CHAIN_READ_HOST, CHAIN_READ_FALLBACK_HOST})
 
 # Domains of brokerages and trading venues with order-entry APIs. Matched as the domain
 # itself or any subdomain. This list exists for clear errors and defence in depth: the

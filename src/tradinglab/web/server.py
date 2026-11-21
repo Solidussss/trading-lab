@@ -78,6 +78,7 @@ class AppState:
         self.inplay: Any = None  # InPlayRunner: the stocks-in-play bots
         self.notifier: Any = None  # DiscordNotifier when DISCORD_WEBHOOK_URL is set
         self.notifier_problem = ""  # why not, when a webhook was given but can't be used
+        self.traders: Any = None  # TraderFeed watching followed wallets (None when off)
         self._failures: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
@@ -351,10 +352,21 @@ def start_hype(state: AppState, settings: Any, env: Mapping[str, str]) -> None:
         state.notifier = notifier  # for the system-health panel; None when phone alerts are off
         state.notifier_problem = getattr(settings, "discord_problem", "")
 
+        # Followed traders: one background watch for the life of the process, shared by every
+        # scout the runner builds. TRADER_WATCH=off leaves it out.
+        watch = None
+        if env.get("TRADER_WATCH", "on").strip().lower() not in {"off", "0", "false", "no"}:
+            from tradinglab.hype.chain import SolanaReadClient
+            from tradinglab.hype.traders import TraderFeed
+
+            watch = TraderFeed(SolanaReadClient())
+            watch.start()
+        state.traders = watch
+
         runner = HypeRunner(bots, variants=[(v, PgHypeStore(state.store, v.id)) for v in variants],
                             feed=feed,
                             scout_factory=lambda: Scout(feed, PgHypeStore(postgres_store(settings), "scout"),
-                                                        notifier=notifier,
+                                                        notifier=notifier, traders=watch,
                                                         tz=getattr(state, "tz", UTC)),
                             scout_store=PgHypeStore(state.store, "scout"))
         state.hype = runner

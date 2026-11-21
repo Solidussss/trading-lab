@@ -6,7 +6,8 @@ DISCORD_WEBHOOK_URL setting (config.py checks its shape) and is never logged or 
 
 What gets sent, so the channel stays worth reading:
   * a coin alert only if it passed the scam check and scores at least PUSH_MIN
-    (whale and proven-wallet alerts score higher, so they clear it more easily);
+    (whale, proven-wallet and followed-trader alerts score higher, so they clear it more
+    easily);
   * a trending subject at most once every two hours;
   * never more than PUSH_PER_HOUR messages in an hour;
   * once a day, a short recap of how the previous day's alerts actually did.
@@ -40,7 +41,8 @@ MAX_CHARS = 1900  # Discord refuses messages over 2,000 characters
 LINK_HOSTS = ("https://dexscreener.com/", "https://solscan.io/")
 
 KIND = {"early": "BEFORE MIGRATION", "migrated": "JUST MIGRATED", "theme": "TRENDING SUBJECT",
-        "whales": "WHALES BUYING", "smart": "PROVEN WALLET"}
+        "whales": "WHALES BUYING", "smart": "PROVEN WALLET", "trader": "PROVEN TRADER BOUGHT",
+        "crowd": "TOP TRADERS BUYING"}
 
 HttpPost = Callable[[str, bytes, dict[str, str], float], tuple]
 

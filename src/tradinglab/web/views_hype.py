@@ -11,6 +11,7 @@ from typing import Any
 from tradinglab.hype.bot import equity
 from tradinglab.hype.model import Account, Rules, sell_fill
 from tradinglab.hype.scout import Scout, summary
+from tradinglab.hype.traders import followed, short
 from tradinglab.web import theme
 
 esc = html.escape
@@ -74,7 +75,10 @@ CSS = """
 .hy .al .ft{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin-top:6px;color:var(--mut)}
 .hy .al .ft a{color:var(--txt);text-decoration:none;border-bottom:1px solid var(--line)}
 .hy .kind{font:600 10px/1 var(--mono);letter-spacing:.06em;padding:3px 6px;border-radius:4px;background:var(--panel2);color:var(--amber)}
-.hy .kind.whales,.hy .kind.smart{color:var(--blue)} .hy .kind.theme{color:var(--mut)}
+.hy .kind.whales,.hy .kind.smart,.hy .kind.trader,.hy .kind.crowd{color:var(--blue)} .hy .kind.theme{color:var(--mut)}
+.hy .mv{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap;padding:9px 13px;border-top:1px solid var(--line);font-size:13px}
+.hy .mv:first-child{border-top:0} .hy .mv time{margin-left:auto;font-size:11px;color:var(--dim)}
+.hy .mv a{color:var(--txt);text-decoration:none;border-bottom:1px solid var(--line)}
 .hy .kind.ok{color:var(--up)}
 .hy .rec{display:flex;gap:6px 18px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin:0 0 10px}
 .hy .rec b{color:var(--txt);font-weight:500}
@@ -260,7 +264,8 @@ def _compare(rows: list[tuple[str, str, str, Rules, bool, Any]], chosen: str) ->
 
 
 KIND_WORDS = {"early": "BEFORE MIGRATION", "migrated": "JUST MIGRATED", "theme": "TRENDING SUBJECT",
-              "whales": "WHALES BUYING", "smart": "PROVEN WALLET"}
+              "whales": "WHALES BUYING", "smart": "PROVEN WALLET", "trader": "PROVEN TRADER BOUGHT",
+              "crowd": "TOP TRADERS BUYING"}
 
 
 def scout_doc(state: Any) -> dict | None:
@@ -312,7 +317,8 @@ def alerts_section(doc: dict | None, now: datetime, limit: int = 12) -> str:
         for k, v in sorted(summary(doc, now).items()))
     if not alerts:
         body = ("<div class='empty'>No alerts yet. The scout looks once a minute for pump fun coins "
-                "drawing a crowd, fresh migrations, trending subjects and whale buying.</div>")
+                "drawing a crowd, fresh migrations, trending subjects, whale buying and what the "
+                "traders it follows are buying.</div>")
     else:
         body = "<div class='list'>" + "".join(alert_row(a, now) for a in alerts[:limit]) + "</div>"
     note = (f"<div class='warn'>The scout had trouble on its last look: {esc(doc['error'])}</div>"
@@ -329,11 +335,84 @@ def alerts_section(doc: dict | None, now: datetime, limit: int = 12) -> str:
               "above is how these alerts have actually done.</p>")
 
 
+def traders_section(doc: dict | None, now: datetime, limit: int = 14, moves: int = 8) -> str:
+    """The traders whose wallets are watched: each one's record as measured here, their last
+    move, and the latest buys and sells across all of them."""
+    book = (doc or {}).get("traders")
+    if doc is None or book is None:
+        return ""
+    records = doc.get("wallets") or {}
+    proven = Scout.smart_wallets(doc)
+    best = sorted(((w, records[w]) for w in proven), key=lambda kv: (kv[1][1] / kv[1][0], kv[1][0]),
+                  reverse=True)
+    names = followed(best)
+    last = book.get("last") or {}
+
+    def order(w: str) -> tuple:
+        r = records.get(w)
+        scored = r is not None and r[0] >= 3
+        return (scored, r[1] / r[0] if scored else 0.0, (last.get(w) or {}).get("at", ""))
+
+    def record(w: str) -> str:
+        r = records.get(w)
+        if r is None or r[0] == 0:
+            return "<td class='num mut'>not scored yet</td><td></td>"
+        return (f"<td class='num'>{r[1]} of {r[0]}</td>"
+                f"<td class='num {_cls(r[2])}'>{_pct(r[2] / r[0], 0)}</td>")
+
+    def latest(w: str) -> str:
+        m = last.get(w)
+        if not m:
+            return "<td class='mut'>nothing seen yet</td>"
+        return (f"<td>{'bought' if m.get('side') == 'buy' else 'sold'} {esc(str(m.get('symbol', '?')))} "
+                f"<span class='mut'>· {esc(_ago(m['at'], now))} ago</span></td>")
+
+    ranked = sorted(names, key=order, reverse=True)
+    watch = book.get("watch") or {}
+    flooded = set(watch.get("flooded") or [])
+
+    def tags(w: str) -> str:
+        return ((" <span class='tag'>PROVEN</span>" if w in proven else "")
+                + (" <span class='tag'>FLOODED</span>" if w in flooded else ""))
+
+    rows = "".join(
+        f"<tr><td><a href='https://solscan.io/account/{esc(w)}' target='_blank' rel='noopener noreferrer'>"
+        f"{esc(names[w])}</a>{tags(w)}</td>{record(w)}{latest(w)}</tr>" for w in ranked[:limit])
+    more = (f"<p class='foot'>and {len(ranked) - limit} more, shown here once they have a record "
+            "or make a move.</p>" if len(ranked) > limit else "")
+    feed = "".join(
+        f"<div class='mv'><b>{esc(str(e.get('name', '?')))}</b>"
+        f"<span class='{'up' if e.get('side') == 'buy' else 'dn'}'>{'bought' if e.get('side') == 'buy' else 'sold'}</span>"
+        f"<span class='num'>${float(e.get('usd', 0)):,.0f}</span><span>of {esc(str(e.get('symbol', '?')))}</span>"
+        + "".join(f"<a href='{esc(url)}' target='_blank' rel='noopener noreferrer'>{esc(site)}</a>"
+                  for site, url in (e.get("links") or {}).items() if str(url).startswith("https://"))
+        + f"<time>{esc(_ago(e['at'], now))} ago</time></div>"
+        for e in (book.get("feed") or [])[:moves])
+    trouble = book.get("error") or watch.get("problem")
+    note = (f"<div class='warn'>Trouble reading the blockchain just now: {esc(str(trouble))}</div>"
+            if trouble else "")
+    return (f"<h2>Traders we follow <span>{len(names)} wallets · watched on the blockchain</span></h2>"
+            "<div class='list'><table class='wl'><thead><tr><th>Trader</th><th>Buys up 20%+ an hour "
+            f"later</th><th>Average after an hour</th><th>Last move</th></tr></thead><tbody>{rows}</tbody>"
+            f"</table></div>{more}"
+            + (f"<h2>Their latest moves <span>newest first</span></h2><div class='list'>{feed}</div>"
+               if feed else "")
+            + note
+            + "<p class='foot'>The record is measured here, from the moment a buy is seen: a fast "
+              "trader can make money on a coin that is down an hour later. An alert is raised when "
+              "a proven trader buys, or when two or more of them buy the same coin within half an "
+              "hour."
+            + (f" {len(flooded)} of the best-known wallets are flooded right now: other people's "
+               "bots imitate them thousands of times a minute, so only some of their real trades "
+               "can be picked out." if flooded else "") + "</p>")
+
+
 def wallets_section(doc: dict | None, limit: int = 10) -> str:
     """Whale wallets the scout has scored itself: big buys it saw, and how many went up."""
     if doc is None:
         return ""
     proven = Scout.smart_wallets(doc)
+    named = followed()  # a known trader's wallet is shown by name
     scored = sorted(((w, r) for w, r in (doc.get("wallets") or {}).items() if r[0] >= 3),
                     key=lambda kv: (kv[1][1] / kv[1][0], kv[1][0]), reverse=True)[:limit]
     if not scored:
@@ -342,7 +421,7 @@ def wallets_section(doc: dict | None, limit: int = 10) -> str:
                 "after three of its big buys have been scored (an hour after each).</div>")
     rows = "".join(
         f"<tr><td><a href='https://solscan.io/account/{esc(w)}' target='_blank' rel='noopener noreferrer'>"
-        f"{esc(w[:4])}…{esc(w[-4:])}</a>{' <span class=\'tag\'>PROVEN</span>' if w in proven else ''}</td>"
+        f"{esc(named.get(w) or short(w))}</a>{' <span class=\'tag\'>PROVEN</span>' if w in proven else ''}</td>"
         f"<td class='num'>{r[1]} of {r[0]}</td><td class='num {_cls(r[2])}'>{_pct(r[2] / r[0], 0)}</td>"
         f"<td>{esc(str(r[4]))}</td></tr>" for w, r in scored)
     return ("<h2>Whale wallets <span>found by the scout</span></h2><div class='list'><table class='wl'>"
@@ -365,7 +444,7 @@ def hype_page(state: Any, now: datetime | None = None, account: str = "") -> str
         account = next((r[0] for r in rows if r[4]), ids[0])
     vid, name, blurb, rules, buys, store = rows[ids.index(account)]
     doc = scout_doc(state)
-    compare = _compare(rows, vid) + alerts_section(doc, now)
+    compare = _compare(rows, vid) + alerts_section(doc, now) + traders_section(doc, now)
     try:
         acct: Account | None = store.load_hype()
         trades = store.hype_trades(60)

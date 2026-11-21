@@ -220,6 +220,10 @@ class C_SourceCodeTests(unittest.TestCase):
                    # (shape checked in config.py, host allowed only when it is set, every call
                    # checked against the egress policy). It cannot read anything back.
                    SRC / "hype" / "notify.py": {"urllib.request"},
+                   # Followed traders: asks a public Solana node two read-only questions (a
+                   # wallet's latest transactions, and one transaction). The client refuses
+                   # any other request, and every call is checked against the egress policy.
+                   SRC / "hype" / "chain.py": {"urllib.request"},
                    SRC / "safety" / "selfcheck.py": {"socket", "urllib.request"},
                    SRC / "safety" / "network_guard.py": {"socket"},
                    SRC / "research" / "claude.py": {"anthropic"}}
@@ -243,6 +247,24 @@ class C_SourceCodeTests(unittest.TestCase):
             text = p.read_text()
             offenders += [f"{p.relative_to(SRC)}: {pat.pattern}" for pat in pats
                           if pat.search(text)]
+        self.assertEqual(offenders, [])
+
+    def test_nothing_can_build_sign_or_send_a_blockchain_transaction(self):
+        # A coin only moves when a transaction signed with a wallet's private key is sent to a
+        # node. No source file may name a request that sends or simulates one, a signing or
+        # wallet library, or key material; the one node client allows exactly two reads.
+        from tradinglab.hype.chain import READ_METHODS
+
+        self.assertEqual(READ_METHODS, {"getSignaturesForAddress", "getTransaction"})
+        words = re.compile(r"sendTransaction|sendRawTransaction|simulateTransaction|requestAirdrop|"
+                           r"sendBundle|signTransaction|signAllTransactions|secret_?key|private_?key|"
+                           r"seed_?phrase|mnemonic|Keypair", re.IGNORECASE)
+        libs = re.compile(r"^(solana|solders|anchorpy|nacl|ed25519|base58|bip_utils|mnemonic|web3|"
+                          r"eth_account)(\.|$)")
+        offenders = [f"{p.relative_to(SRC)}: {m.group(0)}" for p in py_files()
+                     if (m := words.search(p.read_text()))]
+        offenders += [f"{p.relative_to(SRC)}: import {m}" for p in py_files() for m in self._imports(p)
+                      if libs.match(m)]
         self.assertEqual(offenders, [])
 
     def test_no_broker_implementation(self):

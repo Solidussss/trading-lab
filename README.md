@@ -70,6 +70,10 @@ Tiingo EOD API ──► marketdata/tiingo.py ──► BarSource
    - `TIINGO_API_TOKEN` = your Tiingo token
    - `DISCORD_WEBHOOK_URL` (optional) = a Discord channel webhook address. When set, the
      memecoin scout posts its best scam-checked alerts and a daily recap there.
+   - `TRADER_WATCH` (optional) = `off` to stop following trader wallets. By default the
+     scout follows a list of well-known Solana traders (`src/tradinglab/hype/known_traders.py`)
+     and any wallet that earns a good record here, by reading their trades from public
+     Solana nodes. Reading only: the app has no wallet and no keys.
    - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}` (after adding PostgreSQL: **+ New →
      Database → PostgreSQL**). Add only this one; the app refuses libpq `PG*` variables.
 3. Service → Settings → Networking → Generate Domain. Open it on your phone.
