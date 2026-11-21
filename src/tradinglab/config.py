@@ -40,6 +40,9 @@ ALLOWED_APP_ENVS: Final = frozenset({"development", "test", "production"})
 SYMBOL_RE: Final = re.compile(r"^[A-Z]{1,5}$")
 TIINGO_TOKEN_RE: Final = re.compile(r"^[A-Za-z0-9]{20,64}$")
 ANTHROPIC_KEY_RE: Final = re.compile(r"^sk-ant-[A-Za-z0-9_\-]{20,200}$")
+# A Discord webhook: the only place alerts are ever posted. Exactly this host and path shape.
+DISCORD_WEBHOOK_HOST: Final = "discord.com"
+DISCORD_WEBHOOK_RE: Final = re.compile(r"^https://discord\.com/api/webhooks/\d{5,25}/[A-Za-z0-9_\-]{20,200}$")
 _DECIMAL_RE: Final = re.compile(r"^-?\d+(\.\d+)?$")
 LIBPQ_HOST_VARS: Final = frozenset({"PGHOST", "PGHOSTADDR", "PGSERVICE", "PGSERVICEFILE",
                                      "PGPASSFILE", "PGSYSCONFDIR"})
@@ -114,6 +117,8 @@ class Settings:
     data_token: Secret | None = field(default=None, repr=False)
     anthropic_key: Secret | None = field(default=None, repr=False)
     database_url: Secret | None = field(default=None, repr=False)
+    discord_webhook: Secret | None = field(default=None, repr=False)
+    discord_problem: str = ""  # why phone alerts are off although a webhook was given
     egress_hosts: frozenset[str] = DEFAULT_ALLOWED_HOSTS
     trading_mode: str = "simulated"
 
@@ -156,6 +161,19 @@ def load_settings(env: Mapping[str, str]) -> Settings:
         database_url = Secret(_optional(env, "DATABASE_URL", ""))
         egress.add(_database_host(database_url))
 
+    # Optional phone alerts. The host is allowed only when a webhook is actually configured.
+    # A mistyped address must not stop the simulation: alerts simply stay off, the host stays
+    # blocked, and the dashboard says why.
+    discord_webhook, discord_problem = None, ""
+    if env.get("DISCORD_WEBHOOK_URL", "").strip():
+        candidate = env["DISCORD_WEBHOOK_URL"].strip()
+        if DISCORD_WEBHOOK_RE.match(candidate):
+            discord_webhook = Secret(candidate)
+            egress.add(DISCORD_WEBHOOK_HOST)
+        else:
+            discord_problem = ("DISCORD_WEBHOOK_URL doesn't look like a Discord webhook address "
+                               "(https://discord.com/api/webhooks/numbers/token)")
+
     risk = RiskLimits(
         risk_per_trade_pct=_decimal(env, "RISK_PER_TRADE_PCT", "0.005"),
         max_exposure_pct=_decimal(env, "MAX_PORTFOLIO_EXPOSURE_PCT", "0.30"),
@@ -177,6 +195,7 @@ def load_settings(env: Mapping[str, str]) -> Settings:
     return Settings(
         app_env=app_env, capital_base_usd=capital, symbols=symbols, risk=risk,
         data_token=data_token, anthropic_key=anthropic_key, database_url=database_url,
+        discord_webhook=discord_webhook, discord_problem=discord_problem,
         egress_hosts=frozenset(egress),
     )
 

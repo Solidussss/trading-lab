@@ -76,6 +76,8 @@ class AppState:
         self.hype: Any = None  # HypeRunner for the memecoin paper bot (None when off)
         self.intraday: Any = None  # IntradayRunner, for the dashboard's "today so far"
         self.inplay: Any = None  # InPlayRunner: the stocks-in-play bots
+        self.notifier: Any = None  # DiscordNotifier when DISCORD_WEBHOOK_URL is set
+        self.notifier_problem = ""  # why not, when a webhook was given but can't be used
         self._failures: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
@@ -339,11 +341,21 @@ def start_hype(state: AppState, settings: Any, env: Mapping[str, str]) -> None:
                     for v in variants]
 
         # the pages read each account through the dashboard's connection
+        from datetime import UTC
+
+        from tradinglab.hype.notify import DiscordNotifier
         from tradinglab.hype.scout import Scout
+
+        webhook = getattr(settings, "discord_webhook", None)
+        notifier = DiscordNotifier(webhook) if webhook is not None else None
+        state.notifier = notifier  # for the system-health panel; None when phone alerts are off
+        state.notifier_problem = getattr(settings, "discord_problem", "")
 
         runner = HypeRunner(bots, variants=[(v, PgHypeStore(state.store, v.id)) for v in variants],
                             feed=feed,
-                            scout_factory=lambda: Scout(feed, PgHypeStore(postgres_store(settings), "scout")),
+                            scout_factory=lambda: Scout(feed, PgHypeStore(postgres_store(settings), "scout"),
+                                                        notifier=notifier,
+                                                        tz=getattr(state, "tz", UTC)),
                             scout_store=PgHypeStore(state.store, "scout"))
         state.hype = runner
         runner.start()

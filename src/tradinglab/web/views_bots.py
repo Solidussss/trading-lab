@@ -545,6 +545,16 @@ def health_card(state: Any) -> str:
             row("warn", "Coin feed", f"rate-limited {limited}× this hour")
         else:
             row("", "Coin feed", "ok")
+    note = getattr(state, "notifier", None)
+    if note is None and getattr(state, "notifier_problem", ""):
+        row("warn", "Phone alerts (Discord)", "the webhook address looks wrong")
+    elif note is None:
+        row("off", "Phone alerts (Discord)", "not set up")
+    else:
+        st = note.status()
+        row("warn" if st.get("last_error") else "", "Phone alerts (Discord)",
+            f"last message failed ({st['last_error']})" if st.get("last_error") else
+            ("on" if st.get("last_ok") else "on, nothing sent yet"))
     row("", "Database", "ok")
     if sched is not None and sched.status.last_check:
         row("", "Last check", time_label(sched.status.last_check, state.tz))

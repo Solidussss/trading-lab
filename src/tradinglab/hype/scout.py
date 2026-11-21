@@ -39,6 +39,7 @@ log = logging.getLogger(__name__)
 
 DOC = "scout"
 MAX_ALERTS = 150
+DIGEST_HOUR = 9  # the daily recap goes out at 9 am in the owner's time zone
 MAX_BLOCKED = 30  # the latest coins kept out by the scam check, for the page
 MAX_PENDING = 300
 MAX_WALLETS = 500
@@ -132,8 +133,10 @@ class Scout:
     load_doc() and save_doc(). One step a minute; never raises."""
 
     def __init__(self, feed: Any, store: Any,
-                 clock: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+                 notifier: Any = None, tz: Any = UTC) -> None:
         self.feed, self.store, self.clock = feed, store, clock
+        self.notifier, self.tz = notifier, tz  # phone alerts (hype/notify.py); None = off
 
     # -- state ----------------------------------------------------------------------------
 
@@ -152,6 +155,11 @@ class Scout:
         except Exception as exc:  # noqa: BLE001 - a bad minute must not stop the next one
             log.warning("scout: %s: %s", type(exc).__name__, exc)
             doc["error"] = f"{type(exc).__name__}: {exc}"[:300]
+        if self.notifier is not None:
+            try:
+                self._push(doc, now)
+            except Exception as exc:  # noqa: BLE001 - alerts on the page never depend on the phone
+                log.warning("scout: phone alerts failed (%s)", type(exc).__name__)
         doc["updated"] = _iso(now)
         doc["steps"] = int(doc.get("steps", 0)) + 1
         self.store.save_doc(DOC, doc)
@@ -289,6 +297,45 @@ class Scout:
     def smart_wallets(doc: dict) -> set[str]:
         return {w for w, r in doc.get("wallets", {}).items()
                 if r[0] >= SMART_MIN_BUYS and r[1] / r[0] >= SMART_MIN_RATE}
+
+    # -- phone alerts ---------------------------------------------------------------------
+
+    def _push(self, doc: dict, now: datetime) -> None:
+        """Send the alerts worth a buzz (oldest first, so nothing waits behind newer ones),
+        then the daily recap when its hour comes. Anything not sent is tried again next
+        minute, until it is too old to be news."""
+        from tradinglab.hype import notify
+
+        fresh = now - timedelta(minutes=notify.PUSH_MAX_AGE_MIN)
+        last_theme = doc.get("theme_pushed")
+        batch = []
+        for a in reversed(doc["alerts"]):
+            if a.get("pushed") or _when(a["at"]) < fresh or not notify.worth_sending(a):
+                continue
+            if a["kind"] == "theme":
+                gap = timedelta(minutes=notify.THEME_EVERY_MIN)
+                if last_theme and _when(last_theme) + gap > now:
+                    a["pushed"] = "rationed"  # too many subjects lately: this one stays on the page
+                    continue
+                last_theme = _iso(now)
+            batch.append(a)
+        if batch and self.notifier.room() > 0:
+            batch = batch[:4]  # one message, at most four alerts
+            if self.notifier.send("\n\n".join(notify.alert_text(a) for a in batch)):
+                for a in batch:
+                    a["pushed"] = _iso(now)
+                if any(a["kind"] == "theme" for a in batch):
+                    doc["theme_pushed"] = _iso(now)
+        local = now.astimezone(self.tz)
+        day = local.date().isoformat()
+        if local.hour >= DIGEST_HOUR and doc.get("digest_day") != day:
+            stats = summary(doc, now)
+            if not stats:
+                doc["digest_day"] = day  # nothing to report today
+            elif self.notifier.send(notify.digest_text(
+                    stats, [a for a in doc["alerts"] if _when(a["at"]) > now - TRACK_FOR],
+                    int(doc.get("blocked_total", 0)), local.strftime("%a %b %-d"))):
+                doc["digest_day"] = day
 
     # -- how the alerts did ---------------------------------------------------------------
 

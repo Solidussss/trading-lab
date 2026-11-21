@@ -24,7 +24,7 @@ code; see `docs/SAFETY.md`.
 | 10 | Stocks in play: morning scan of ~100 stocks, opening breakouts in the top five gappers, and an odds-checked twin that replays the rest of the day before each entry | ✅ forward paper trading only (no history test) |
 | 11 | Hype bot rule sets side by side, positions priced from DexScreener first, back-off when rate-limited | ✅ |
 | 12 | Review of the seven fund bots on 2017-2024 prices: six retired, the noise breakout kept on SPY and QQQ, two of the ideas moved to stocks in play (docs/RESEARCH.md) | ✅ |
-| 13 | Memecoin scout (`hype/scout.py`): once a minute, alerts for coins still on the pump fun curve that are drawing a crowd, fresh migrations, trending subjects and whale buying; scores whale wallets itself; follows every alert's price so the page shows how the alerts did. Three more paper rule sets: follow the whales, whales with a quick exit, before they migrate. Memecoins lead the home page Every coin alert and the three newest rule sets go through a scam check (RugCheck's public report: creator history, holder concentration, mint and freeze powers) | ✅ on-chain data only; X/Twitter buzz and phone notifications not built |
+| 13 | Memecoin scout (`hype/scout.py`): once a minute, alerts for coins still on the pump fun curve that are drawing a crowd, fresh migrations, trending subjects and whale buying; scores whale wallets itself; follows every alert's price so the page shows how the alerts did. Three more paper rule sets: follow the whales, whales with a quick exit, before they migrate. Memecoins lead the home page Every coin alert and the three newest rule sets go through a scam check (RugCheck's public report: creator history, holder concentration, mint and freeze powers) | ✅ on-chain data only; phone alerts through a Discord webhook; X/Twitter buzz not built |
 | 8 | Claude research reports (scheduled / on demand only) | |
 
 ## Architecture
@@ -68,6 +68,8 @@ Tiingo EOD API ──► marketdata/tiingo.py ──► BarSource
    - `DASHBOARD_PASSWORD` = a password of at least 12 characters (you log in with any
      username and this password)
    - `TIINGO_API_TOKEN` = your Tiingo token
+   - `DISCORD_WEBHOOK_URL` (optional) = a Discord channel webhook address. When set, the
+     memecoin scout posts its best scam-checked alerts and a daily recap there.
    - `DATABASE_URL` = `${{Postgres.DATABASE_URL}}` (after adding PostgreSQL: **+ New →
      Database → PostgreSQL**). Add only this one; the app refuses libpq `PG*` variables.
 3. Service → Settings → Networking → Generate Domain. Open it on your phone.

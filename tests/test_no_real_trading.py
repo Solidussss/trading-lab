@@ -216,6 +216,10 @@ class C_SourceCodeTests(unittest.TestCase):
                          r"websocket|websockets|socket|anthropic)(\.|$)")
         allowed = {SRC / "marketdata" / "tiingo.py": {"urllib.request"},
                    SRC / "hype" / "dexscreener.py": {"urllib.request"},
+                   # Phone alerts: posts text to the one Discord webhook named in the settings
+                   # (shape checked in config.py, host allowed only when it is set, every call
+                   # checked against the egress policy). It cannot read anything back.
+                   SRC / "hype" / "notify.py": {"urllib.request"},
                    SRC / "safety" / "selfcheck.py": {"socket", "urllib.request"},
                    SRC / "safety" / "network_guard.py": {"socket"},
                    SRC / "research" / "claude.py": {"anthropic"}}
