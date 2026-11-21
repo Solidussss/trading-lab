@@ -14,6 +14,11 @@ Wallet records are built by the scout itself: every big buy it sees is remembere
 later it checks whether the coin went up. A wallet earns "good record" only after five such
 buys with at least three in five up by 20% or more.
 
+Before any coin alert is raised the coin goes through the scam check (hype/rugcheck.py). A coin
+with a danger-level finding (its creator has rugged before, one wallet holds most of it, the
+creator can still mint or freeze) is kept out and counted. A coin that could not be checked is
+still alerted, marked as unchecked.
+
 Every alert keeps the price it was raised at and the best and latest price since, so the page
 can show how the alerts actually did. That record is the point: it is how to tell whether an
 alert type is worth acting on.
@@ -34,6 +39,7 @@ log = logging.getLogger(__name__)
 
 DOC = "scout"
 MAX_ALERTS = 150
+MAX_BLOCKED = 30  # the latest coins kept out by the scam check, for the page
 MAX_PENDING = 300
 MAX_WALLETS = 500
 REPEAT_AFTER = timedelta(hours=6)  # the same alert about the same coin is not raised again sooner
@@ -205,12 +211,26 @@ class Scout:
         if key in doc["seen"]:
             return False
         doc["seen"][key] = _iso(now + REPEAT_AFTER)
-        grade = round(min(score(s) * 0.8 + bonus + {"smart": 25, "whales": 20}.get(kind, 0), 100.0), 1)
+        safety: dict = {"checked": False}
+        if kind != "theme":  # a subject is not a coin; every coin alert goes through the scam check
+            check = getattr(self.feed, "safety", None)
+            verdict = check(s.token, s.pre_migration) if check is not None else None
+            if verdict is not None and verdict.bad:
+                doc["blocked"] = ([{"at": _iso(now), "symbol": s.symbol, "kind": kind,
+                                    "why": verdict.dangers[0]}] + doc.get("blocked", []))[:MAX_BLOCKED]
+                doc["blocked_total"] = int(doc.get("blocked_total", 0)) + 1
+                log.info("scout kept out %s (%s): %s", s.symbol, kind, verdict.dangers[0])
+                return False
+            if verdict is not None:
+                safety = verdict.to_json()
+                bonus += -10.0 if verdict.warnings else 5.0
+        grade = round(min(max(score(s) * 0.8 + bonus + {"smart": 25, "whales": 20}.get(kind, 0), 0.0),
+                          100.0), 1)
         doc["alerts"] = ([{
             "at": _iso(now), "kind": kind, "token": s.token, "pair": s.pair, "symbol": s.symbol,
             "title": title or s.symbol, "text": text, "score": grade, "price": s.price,
             "last": s.price, "peak": s.price, "dex": s.dex, "mcap": s.market_cap,
-            "links": links(s)}] + doc["alerts"])[:MAX_ALERTS]
+            "safety": safety, "links": links(s)}] + doc["alerts"])[:MAX_ALERTS]
         log.info("scout alert [%s] %s: %s", kind, title or s.symbol, text)
         return True
 

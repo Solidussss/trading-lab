@@ -137,6 +137,7 @@ class Rules:
     stake_pct: float = 0.0  # above 0: bet this share of the account instead of the fixed stake
     stage: str = ""  # "pre": only coins still on pump fun's curve (found through feed.early())
     min_curve: float = 0.0  # with stage "pre": how far along the curve a coin must be (0 to 1)
+    scam_check: bool = False  # buy only coins that pass RugCheck's report (hype/rugcheck.py)
 
 
 @dataclass(frozen=True)
@@ -160,19 +161,20 @@ VARIANTS: tuple[Variant, ...] = (
     # has to be holding up (not falling), and three whales must have bought in the last ten
     # minutes with little whale selling against them. Sells when the whales turn.
     Variant("whales", "Follow the whales", "Buys only when big wallets are buying",
-            Rules(whale_min_usd=250.0, min_chg_5m=0.0, min_vol_accel=1.0, min_score=0.0,
+            Rules(scam_check=True, whale_min_usd=250.0, min_chg_5m=0.0, min_vol_accel=1.0, min_score=0.0,
                   no_repeat_losers=True, cooldown_hours=24.0)),
     # The same whale rule with the quick exit and account-sized bets from the "agent bot"
     # videos: out at -8%, 7% of the account per coin.
     # Before they migrate: coins still on pump fun's curve that are drawing a crowd. Found
     # through DexScreener's fresh profiles and boosts; small, young, busy, more buying than selling.
     Variant("early", "Before they migrate", "Buys buzzing pump fun coins before they migrate",
-            Rules(stage="pre", min_curve=0.15, min_liquidity=3_000.0, min_mcap=0.0, max_mcap=1e12,
+            Rules(scam_check=True,
+                  stage="pre", min_curve=0.15, min_liquidity=3_000.0, min_mcap=0.0, max_mcap=1e12,
                   min_age_min=5.0, max_age_hours=3.0, min_txns_5m=60, min_buy_ratio=0.55,
                   min_vol_accel=1.0, min_chg_5m=0.0, min_score=0.0, no_repeat_losers=True,
                   cooldown_hours=24.0)),
     Variant("whales_quick", "Whales, quick exit", "Whale buys, out at -8%, bets 7% of the account",
-            Rules(whale_min_usd=250.0, min_chg_5m=0.0, min_vol_accel=1.0, min_score=0.0,
+            Rules(scam_check=True, whale_min_usd=250.0, min_chg_5m=0.0, min_vol_accel=1.0, min_score=0.0,
                   no_repeat_losers=True, cooldown_hours=24.0, stop_loss=-0.08, stake_pct=0.07)),
 )
 

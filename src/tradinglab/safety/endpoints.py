@@ -6,7 +6,8 @@ market data. The egress policy makes that structural rather than a convention:
   * DENY first: any host under a known brokerage / exchange-trading domain raises
     BrokerageForbiddenError, even if someone adds it to the allowlist by mistake.
   * ALLOW only: the market-data provider (api.tiingo.com), the Claude API
-    (api.anthropic.com), the configured PostgreSQL host, and loopback/private addresses.
+    (api.anthropic.com), three read-only crypto data services (DexScreener, GeckoTerminal,
+    RugCheck), the configured PostgreSQL host, and loopback/private addresses.
   * Everything else raises EgressDeniedError (fail closed), including hosts we have never
     heard of and public IP literals (which cannot be checked against a hostname list).
 
@@ -34,8 +35,13 @@ CRYPTO_DATA_URL: Final = f"https://{CRYPTO_DATA_HOST}"
 POOL_DATA_HOST: Final = "api.geckoterminal.com"
 POOL_DATA_URL: Final = f"https://{POOL_DATA_HOST}"
 
+# RugCheck: token safety reports (who holds a coin, what its creator can still do, whether the
+# creator has rugged before). An analysis service, read-only: no accounts, wallets or orders.
+RUG_REPORT_HOST: Final = "api.rugcheck.xyz"
+RUG_REPORT_URL: Final = f"https://{RUG_REPORT_HOST}"
+
 DEFAULT_ALLOWED_HOSTS: Final[frozenset[str]] = frozenset(
-    {DATA_PROVIDER_HOST, RESEARCH_HOST, CRYPTO_DATA_HOST, POOL_DATA_HOST})
+    {DATA_PROVIDER_HOST, RESEARCH_HOST, CRYPTO_DATA_HOST, POOL_DATA_HOST, RUG_REPORT_HOST})
 
 # Domains of brokerages and trading venues with order-entry APIs. Matched as the domain
 # itself or any subdomain. This list exists for clear errors and defence in depth: the

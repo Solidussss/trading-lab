@@ -17,7 +17,8 @@ class LoadSettingsTests(unittest.TestCase):
         self.assertEqual(s.risk.max_exposure_pct, Decimal("0.30"))
         self.assertEqual(s.risk.max_open_positions, 3)
         self.assertEqual(s.egress_hosts, frozenset({"api.tiingo.com", "api.anthropic.com",
-                                                   "api.dexscreener.com", "api.geckoterminal.com"}))
+                                                   "api.dexscreener.com", "api.geckoterminal.com",
+                                                   "api.rugcheck.xyz"}))
         self.assertIsNone(s.data_token)
 
     def test_trading_mode_must_be_exactly_simulated(self):

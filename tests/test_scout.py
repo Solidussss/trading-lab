@@ -9,9 +9,10 @@ from datetime import timedelta
 from tests.test_hype import NOW_MS, T0, Clock, FakeSource, Tick, hot, next_scan, pair, why_nots
 from tradinglab.hype.bot import HypeBot, MemoryHypeStore
 from tradinglab.hype.dexscreener import MarketDataError, parse_pair
-from tradinglab.hype.feeds import TRADES_TTL, SharedFeed
+from tradinglab.hype.feeds import SAFETY_PER_MINUTE, SAFETY_TTL, TRADES_TTL, SharedFeed
 from tradinglab.hype.geckoterminal import GeckoTerminalClient
 from tradinglab.hype.model import VARIANTS, Rules, curve_liquidity, curve_progress
+from tradinglab.hype.rugcheck import RugCheckClient, Verdict, judge
 from tradinglab.hype.scout import Scout, is_early, is_migrated, links, summary, themes
 from tradinglab.hype.whales import big_size, flow
 
@@ -25,6 +26,10 @@ def trade(kind, usd, wallet, minutes_ago=1.0, **extra):
 
 BUYING = [trade("buy", 1500, "w1"), trade("buy", 2500, "w2"), trade("buy", 1200, "w3"),
           trade("sell", 1100, "w9")]
+
+
+CLEAN = Verdict(7, (), ())
+RUGGER = Verdict(80, ("creator has a history of rugging tokens",), ())
 
 
 def curve_pair(addr=MINT, mcap=20_000, buys=90, sells=40, age_min=20, sol=170.0, **kw):
@@ -44,6 +49,12 @@ class Market(FakeSource):
         self.early_coins: list = []
         self.trades: dict[str, list | None] = {}
         self.trade_calls: list = []
+        self.verdicts: dict[str, Verdict | None] = {}  # token -> scam check; clean unless said
+        self.safety_calls: list = []
+
+    def safety(self, token, pre_migration=False):
+        self.safety_calls.append((token, pre_migration))
+        return self.verdicts.get(token, CLEAN)
 
     def early(self):
         return list(self.early_coins)
@@ -121,11 +132,29 @@ class WhaleRuleSetTests(unittest.TestCase):
         self.assertIn("3 big wallets bought", acct.positions[0].why)
         self.assertEqual(m.trade_calls[0], ("PTokA1", 400.0))  # 1% of its $40,000 pool
 
-    def test_an_ordinary_rule_set_never_asks_for_whale_data(self):
+    def test_an_ordinary_rule_set_never_asks_for_whale_data_or_a_scam_check(self):
         bot, m, _ = self.bot(Rules())
         m.data["TokA1"] = hot()
         self.assertEqual(len(bot.step().positions), 1)
-        self.assertEqual(m.trade_calls, [])
+        self.assertEqual((m.trade_calls, m.safety_calls), ([], []))
+
+    def test_a_coin_that_fails_or_cannot_get_the_scam_check_is_not_bought(self):
+        bot, m, clock = self.bot()
+        m.trades["PTokA1"] = BUYING  # the whales are buying it, which is exactly the trap
+        m.verdicts["TokA1"] = RUGGER
+        acct = bot.step()
+        self.assertEqual(acct.positions, [])
+        self.assertIn("failed the scam check (creator has a history of rugging tokens)", why_nots(acct))
+        self.assertEqual(m.trade_calls, [])  # no point asking about whales after that
+        m.verdicts["TokA1"] = None  # the check is down
+        acct = next_scan(bot, clock)
+        self.assertEqual(acct.positions, [])
+        self.assertIn("no scam check right now", why_nots(acct))
+        m.verdicts["TokA1"] = CLEAN
+        m.trades["PTokA1"] = [replace_time(t, clock.t + timedelta(minutes=1)) for t in BUYING]
+        acct = next_scan(bot, clock)
+        self.assertEqual(len(acct.positions), 1)
+        self.assertIn("passed the scam check (risk 7/100)", acct.positions[0].why)
 
     def test_sells_when_the_whales_turn(self):
         bot, m, clock = self.bot()
@@ -282,6 +311,29 @@ class ScoutTests(unittest.TestCase):
         self.assertAlmostEqual(s["peak"], 2.0)
         self.assertAlmostEqual(s["now"], 0.5)
 
+    def test_a_coin_that_fails_the_scam_check_is_kept_out_and_counted(self):
+        self.m.early_coins = [parse_pair(curve_pair(), NOW_MS)]
+        self.m.verdicts[MINT] = RUGGER
+        doc = self.scout.step()
+        self.assertEqual(doc["alerts"], [])
+        self.assertEqual((doc["blocked_total"], doc["blocked"][0]["symbol"], doc["blocked"][0]["why"]),
+                         (1, "Mint", "creator has a history of rugging tokens"))
+        self.assertEqual(self.m.safety_calls, [(MINT, True)])  # told it is still on the curve
+        self.clock.t += timedelta(minutes=1)
+        doc = self.scout.step()
+        self.assertEqual((doc["alerts"], doc["blocked_total"]), ([], 1))  # not asked again for hours
+
+    def test_alerts_say_whether_they_were_checked(self):
+        coins = [parse_pair(curve_pair(addr=a), NOW_MS) for a in ("CleanAAApump", "WarnBBBpump", "DownCCCpump")]
+        self.m.early_coins = coins
+        self.m.verdicts["WarnBBBpump"] = Verdict(35, (), ("top 10 holders high ownership",))
+        self.m.verdicts["DownCCCpump"] = None
+        got = {a["token"]: a for a in self.scout.step()["alerts"]}
+        self.assertEqual(got["CleanAAApump"]["safety"], {"checked": True, "score": 7, "dangers": [], "warnings": []})
+        self.assertEqual(got["WarnBBBpump"]["safety"]["warnings"], ["top 10 holders high ownership"])
+        self.assertEqual(got["DownCCCpump"]["safety"], {"checked": False})
+        self.assertGreater(got["CleanAAApump"]["score"], got["WarnBBBpump"]["score"])
+
     def test_a_dead_feed_is_recorded_not_raised(self):
         def boom():
             raise ConnectionError("down")
@@ -304,6 +356,79 @@ class ScoutTests(unittest.TestCase):
         for url in got.values():
             self.assertTrue(url.startswith("https://"))
             self.assertFalse(is_brokerage_host(url.split("/")[2]))
+
+
+class ScamCheckTests(unittest.TestCase):
+    SUMMARY = {"score_normalised": 80, "lpLockedPct": 96.9, "risks": [
+        {"name": "Creator history of rugged tokens", "description": "Creator has a history of rugging tokens.",
+         "level": "danger", "value": ""},
+        {"name": "Low Liquidity", "description": "Low amount of liquidity in the token pool",
+         "level": "danger", "value": "$780.64"},
+        {"name": "Top 10 holders high ownership", "description": "", "level": "warn", "value": "62%"},
+        "junk"]}
+
+    def test_reads_dangers_and_warnings_in_plain_words(self):
+        v = judge(self.SUMMARY)
+        self.assertEqual(v.score, 80)
+        self.assertEqual(v.dangers, ("creator has a history of rugging tokens",
+                                     "low amount of liquidity in the token pool ($780.64)"))
+        self.assertEqual(v.warnings, ("top 10 holders high ownership (62%)",))
+        self.assertTrue(v.bad)
+
+    def test_a_small_pool_is_not_a_warning_sign_on_the_curve(self):
+        v = judge({**self.SUMMARY, "risks": self.SUMMARY["risks"][1:2]}, pre_migration=True)
+        self.assertEqual((v.dangers, v.bad), ((), False))
+        self.assertTrue(judge({**self.SUMMARY, "risks": self.SUMMARY["risks"][1:2]}).bad)
+
+    def test_a_clean_report_passes_and_anything_else_is_an_error_never_a_pass(self):
+        self.assertEqual(judge({"score_normalised": 1, "risks": []}), Verdict(1, (), ()))
+        for junk in (None, [], {"error": "not found"}, {"risks": "none"}):
+            with self.assertRaises(MarketDataError):
+                judge(junk)
+
+    def test_the_client_asks_only_for_real_addresses_and_reports_failures(self):
+        import json
+
+        seen = []
+
+        def http_get(url, headers, timeout):
+            seen.append(url)
+            return (200, json.dumps(self.SUMMARY).encode(), {}) if "Good" in url else (429, b"", {})
+
+        client = RugCheckClient(http_get=http_get)
+        self.assertTrue(client.verdict("GoodMint1").bad)
+        self.assertEqual(seen, ["https://api.rugcheck.xyz/v1/tokens/GoodMint1/report/summary"])
+        with self.assertRaisesRegex(MarketDataError, "429"):
+            client.verdict("SlowMint2")
+        with self.assertRaises(MarketDataError):
+            client.verdict("../../etc")
+        self.assertEqual(len(seen), 2)
+
+    def test_the_feed_keeps_verdicts_caps_the_rate_and_backs_off(self):
+        class Src:
+            calls: list = []
+
+            def verdict(self, mint, pre_migration=False):
+                Src.calls.append(mint)
+                if mint == "limited":
+                    raise MarketDataError("RugCheck unavailable: HTTP 429")
+                return CLEAN
+
+        tick = Tick()
+        feed = SharedFeed(discover=FakeSource(), price=FakeSource(), clock=tick, safety=Src())
+        self.assertEqual(feed.safety("a"), CLEAN)
+        self.assertEqual(feed.safety("a"), CLEAN)
+        self.assertEqual(Src.calls, ["a"])  # kept, not asked twice
+        for i in range(SAFETY_PER_MINUTE + 3):
+            feed.safety(f"m{i}")
+        self.assertEqual(len(Src.calls), SAFETY_PER_MINUTE)  # the rest got "not now", without waiting
+        self.assertIsNone(feed.safety("zzz"))
+        tick.t += 61
+        self.assertIsNone(feed.safety("limited"))
+        self.assertIsNone(feed.safety("b"))  # told to slow down: nobody is asked for five minutes
+        tick.t += SAFETY_TTL
+        self.assertEqual(feed.safety("b"), CLEAN)
+        self.assertIsNone(SharedFeed(discover=FakeSource(), price=FakeSource(), clock=tick).safety("a"))
 
 
 class FeedAndClientTests(unittest.TestCase):

@@ -75,6 +75,7 @@ CSS = """
 .hy .al .ft a{color:var(--txt);text-decoration:none;border-bottom:1px solid var(--line)}
 .hy .kind{font:600 10px/1 var(--mono);letter-spacing:.06em;padding:3px 6px;border-radius:4px;background:var(--panel2);color:var(--amber)}
 .hy .kind.whales,.hy .kind.smart{color:var(--blue)} .hy .kind.theme{color:var(--mut)}
+.hy .kind.ok{color:var(--up)}
 .hy .rec{display:flex;gap:6px 18px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin:0 0 10px}
 .hy .rec b{color:var(--txt);font-weight:500}
 .hy table.wl{width:100%;border-collapse:collapse;font-size:13px}
@@ -281,11 +282,20 @@ def alert_row(a: dict, now: datetime) -> str:
         last, best = a.get("last", a["price"]) / a["price"] - 1, a.get("peak", a["price"]) / a["price"] - 1
         moved = (f"<span>since the alert <b class='num {_cls(last)}'>{_pct(last, 0)}</b></span>"
                  f"<span>best <b class='num {_cls(best)}'>{_pct(best, 0)}</b></span>")
+    safety, check = a.get("safety") or {}, ""
+    if kind != "theme":
+        if not safety.get("checked"):
+            check = "<span class='kind theme'>NOT SCAM-CHECKED</span>"
+        elif safety.get("warnings"):
+            check = "<span class='kind'>CAUTION</span>"
+            moved += f"<span>caution: {esc('; '.join(map(str, safety['warnings'])))}</span>"
+        else:
+            check = f"<span class='kind ok'>PASSED SCAM CHECK · RISK {int(safety.get('score', 0))}/100</span>"
     where = "".join(f"<a href='{esc(url)}' target='_blank' rel='noopener noreferrer'>{esc(name)}</a>"
                     for name, url in (a.get("links") or {}).items()
                     if str(url).startswith("https://"))
     return (f"<div class='al'><div class='hd'><span class='kind {esc(kind)}'>"
-            f"{esc(KIND_WORDS.get(kind, kind.upper()))}</span><b>{esc(str(a.get('title', '?')))}</b>"
+            f"{esc(KIND_WORDS.get(kind, kind.upper()))}</span><b>{esc(str(a.get('title', '?')))}</b>{check}"
             f"<span class='num mut'>score {float(a.get('score', 0)):.0f}</span>"
             f"<time>{esc(_ago(a['at'], now))} ago</time></div><p>{esc(str(a.get('text', '')))}</p>"
             f"<div class='ft'>{moved}{where}</div></div>")
@@ -307,6 +317,12 @@ def alerts_section(doc: dict | None, now: datetime, limit: int = 12) -> str:
         body = "<div class='list'>" + "".join(alert_row(a, now) for a in alerts[:limit]) + "</div>"
     note = (f"<div class='warn'>The scout had trouble on its last look: {esc(doc['error'])}</div>"
             if doc.get("error") else "")
+    kept_out = doc.get("blocked") or []
+    if kept_out:
+        latest = "; ".join(f"{esc(str(b.get('symbol', '?')))} ({esc(str(b.get('why', '')))})"
+                           for b in kept_out[:3])
+        record += (f"<span>kept out by the scam check: <b>{int(doc.get('blocked_total', len(kept_out)))}</b> "
+                   f"coins. Latest: {latest}</span>")
     return (f"<h2>Alerts <span>{len(alerts)} kept · newest first</span></h2>"
             + (f"<p class='rec'>Last 24 hours: {record}</p>" if record else "") + body + note
             + "<p class='foot'>An alert is a heads-up, not a tip: most new coins fall. The record "
@@ -411,6 +427,11 @@ def hype_page(state: Any, now: datetime | None = None, account: str = "") -> str
     if getattr(rules, "stage", "") == "pre":
         extra += ("<li><b>Only coins still on pump fun</b>, before they migrate, found through "
                   "DexScreener's fresh profiles and boosts.</li>")
+    if getattr(rules, "scam_check", False):
+        extra += ("<li><b>Scam check first:</b> it only buys a coin whose RugCheck report has no "
+                  "danger finding (a creator who has rugged before, one wallet holding most of the "
+                  "supply, a creator who can still mint or freeze). A coin that can't be checked "
+                  "is not bought.</li>")
     if getattr(rules, "whale_min_usd", 0) > 0:
         extra += (f"<li><b>Needs whales:</b> at least {rules.whale_min_buyers} different wallets must "
                   f"each have made a big buy (1% of the pool, at least ${rules.whale_min_usd:,.0f}) in the last "

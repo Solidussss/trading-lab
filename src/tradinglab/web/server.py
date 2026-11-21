@@ -328,7 +328,10 @@ def start_hype(state: AppState, settings: Any, env: Mapping[str, str]) -> None:
         gecko, dex = GeckoTerminalClient(), DexScreenerClient()
         # New coins: GeckoTerminal first. Open positions: DexScreener first, so a rate-limited
         # scan feed can't stop the stops from being checked. One feed serves every variant.
-        feed = SharedFeed(discover=(gecko, dex), price=(dex, gecko), trades=gecko, early=dex)
+        from tradinglab.hype.rugcheck import RugCheckClient
+
+        feed = SharedFeed(discover=(gecko, dex), price=(dex, gecko), trades=gecko, early=dex,
+                          safety=RugCheckClient())
 
         def bots() -> list[HypeBot]:
             pg = postgres_store(settings)  # the bot thread's own connection

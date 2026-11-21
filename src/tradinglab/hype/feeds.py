@@ -24,6 +24,8 @@ from tradinglab.hype.model import Snapshot
 
 DISCOVER_TTL = 60.0  # one scan result serves every variant for a minute
 RATE_LIMIT_PAUSE = 300.0  # after a 429, don't scan through that provider for five minutes
+SAFETY_TTL = 1800.0  # a token's scam check is kept for half an hour
+SAFETY_PER_MINUTE = 8  # scam checks asked for in any minute; beyond that the answer is "not now"
 TRADES_TTL = 60.0  # a pool's big trades are asked for at most once a minute, for every variant
 PRICE_TTL = 8.0  # a coin's price is asked for at most once per cycle, however many variants hold it
 STATUS_WINDOW = 3600.0  # status() counts rate-limit replies over the last hour
@@ -42,8 +44,11 @@ class SharedFeed:
     """
 
     def __init__(self, discover: Any, price: Any, clock: Callable[[], float] = time.time,
-                 trades: Any = None, early: Any = None) -> None:
+                 trades: Any = None, early: Any = None, safety: Any = None) -> None:
         self._discover, self._price, self._clock = _sources(discover), _sources(price), clock
+        self._safety_src = safety  # a client with .verdict(mint, pre_migration), or None
+        self._verdicts: dict[tuple[str, bool], tuple[float, Any]] = {}
+        self._safety_asked: deque[float] = deque()
         self._early_src = early  # a client whose discover() lists freshly profiled/boosted coins
         self._early: tuple[float, list[Snapshot]] | None = None
         self._trades_src = trades  # a client with .trades(pool, min_usd), or None
@@ -137,6 +142,35 @@ class SharedFeed:
                 self._failed(src, exc, now, DISCOVER_TTL)
         self._early = (now, found)
         return list(found)
+
+    # -- scam check -----------------------------------------------------------------------
+
+    def safety(self, mint: str, pre_migration: bool = False) -> Any:
+        """The scam-check verdict for a token, or None when it can't be had right now (no
+        source, too many asked this minute, the provider is rate-limiting, or the call failed).
+        A verdict is kept for half an hour; a failure is asked about again after a minute."""
+        now = self._clock()
+        key = (mint, pre_migration)
+        got = self._verdicts.get(key)
+        if got is not None and now - got[0] < (SAFETY_TTL if got[1] is not None else TRADES_TTL):
+            return got[1]
+        src = self._safety_src
+        if src is None or self._quiet.get(id(src), (now, ""))[0] > now:
+            return None
+        while self._safety_asked and now - self._safety_asked[0] >= 60.0:
+            self._safety_asked.popleft()
+        if len(self._safety_asked) >= SAFETY_PER_MINUTE:
+            return None  # never wait: an unchecked coin is handled by the caller
+        self._safety_asked.append(now)
+        verdict = None
+        try:
+            verdict = src.verdict(mint, pre_migration)
+        except Exception as exc:  # noqa: BLE001 - "unchecked" is an answer the callers handle
+            self._failed(src, exc, now, 0.0)
+        if len(self._verdicts) > 2000:
+            self._verdicts = {k: v for k, v in self._verdicts.items() if now - v[0] < SAFETY_TTL}
+        self._verdicts[key] = (now, verdict)
+        return verdict
 
     # -- big trades (whale flow) ----------------------------------------------------------
 

@@ -256,6 +256,16 @@ class HypeBot:
             room = (len(acct.positions) < self.rules.max_open
                     and bought < self.rules.max_new_per_cycle and acct.cash >= stake)
             whales = None
+            passed = ""
+            if not no and room and self.rules.scam_check:
+                check = getattr(self.source, "safety", None)
+                verdict = check(s.token, s.pre_migration) if check is not None else None
+                if verdict is None:
+                    no.append("no scam check right now")  # unchecked is not bought
+                elif verdict.bad:
+                    no.append(f"failed the scam check ({verdict.dangers[0]})")
+                else:
+                    passed = f"passed the scam check (risk {verdict.score}/100)"
             if not no and room and self.rules.whale_min_usd > 0:
                 # the last gate, and the only one that costs a data request: asked for the best
                 # few coins that pass everything else
@@ -270,7 +280,7 @@ class HypeBot:
                         no.append(f"whales aren't buying ({whales.words()})")
             can_buy = not no and room
             if can_buy:
-                self._buy(acct, s, now, stake, whales)
+                self._buy(acct, s, now, stake, whales, passed)
                 bought += 1
             elif not no:
                 no.append("no free slot" if len(acct.positions) >= self.rules.max_open else "no cash")
@@ -306,13 +316,15 @@ class HypeBot:
         return flow(rows, now, self.rules.whale_window_min, size)
 
     def _buy(self, acct: Account, s: Snapshot, now: datetime, stake: float | None = None,
-             whales: Flow | None = None) -> None:
+             whales: Flow | None = None, passed: str = "") -> None:
         stake = self.rules.stake if stake is None else stake
         eff, qty = buy_fill(s.price, stake, s.liquidity, self.rules)
         why = (f"score {score(s):.0f}: {s.buy_ratio:.0%} buys, volume {s.vol_accel:.1f}x normal, "
                f"+{s.chg_5m:.0f}% in 5 min, ${s.liquidity:,.0f} pool")
         if whales is not None:
             why = f"{whales.words()} in {self.rules.whale_window_min:.0f} min; " + why
+        if passed:
+            why += "; " + passed
         acct.cash -= stake
         acct.positions.append(Position(
             token=s.token, symbol=s.symbol, url=s.url, opened=_iso(now), stake=stake, qty=qty,
