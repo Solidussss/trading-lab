@@ -316,11 +316,13 @@ class GeckoTest(unittest.TestCase):
 
 class VariantTest(unittest.TestCase):
     def test_three_variants_in_order(self):
-        self.assertEqual([(v.id, v.name, v.blurb, v.buys_enabled) for v in VARIANTS], [
+        self.assertEqual([v.id for v in VARIANTS],
+                         ["current", "no_repeat", "deep_pools", "whales", "early", "whales_quick"])
+        self.assertEqual([(v.id, v.name, v.blurb, v.buys_enabled) for v in VARIANTS[:3]], [
             ("current", "Current rules", "Chases 5-minute jumps", False),
             ("no_repeat", "No repeat losers", "Never re-buys a coin it lost on", True),
             ("deep_pools", "Bigger pools only", "Skips anything under $100k in the pool", True)])
-        current, no_repeat, deep = VARIANTS
+        current, no_repeat, deep = VARIANTS[:3]
         self.assertEqual(current.rules, Rules())
         self.assertEqual(no_repeat.rules, replace(Rules(), no_repeat_losers=True, cooldown_hours=24.0))
         self.assertEqual(deep.rules, replace(Rules(), min_liquidity=100_000.0, min_mcap=500_000.0,
@@ -644,7 +646,8 @@ class FeedTest(unittest.TestCase):
             clock.t += timedelta(seconds=CYCLE_SECONDS)
             self.tick.t += CYCLE_SECONDS
         self.assertEqual((self.gecko.discovers, self.dex.discovers), (2, 0))
-        self.assertEqual([len(a.positions) for a in accounts], [0, 2, 0, 2])  # paused / buys / too thin
+        # paused / buys / too thin / no whale data / no early list / no whale data / the twin buys
+        self.assertEqual([len(a.positions) for a in accounts], [0, 2, 0, 0, 0, 0, 2])
 
 
 class RunnerTest(unittest.TestCase):
@@ -665,8 +668,8 @@ class RunnerTest(unittest.TestCase):
     def test_runs_every_variant_and_exposes_them_to_the_dashboard(self):
         r = self.runner()
         r.run_once()
-        self.assertEqual([v.id for v, _ in r.variants], ["current", "no_repeat", "deep_pools"])
-        self.assertEqual([len(s.load_hype().positions) for _, s in r.variants], [0, 1, 0])
+        self.assertEqual([v.id for v, _ in r.variants], [v.id for v in VARIANTS])
+        self.assertEqual([len(s.load_hype().positions) for _, s in r.variants], [0, 1, 0, 0, 0, 0])
         for _, store in r.variants:
             self.assertEqual(store.hype_trades(5), [])
             self.assertEqual(store.hype_stats()[0], 0)
@@ -828,6 +831,16 @@ class PgHypeStoreTest(test_pg_store.PgTestCase):
         self.assertEqual(other.hype_stats(), (1, 0, -10.0, -10.0, -10.0))
         self.assertEqual(PgHypeStore(self.store, "deep_pools").hype_stats(), (0, 0, 0.0, 0.0, 0.0))
 
+    def test_the_scouts_document_lives_beside_the_accounts_without_becoming_one(self):
+        scout = PgHypeStore(self.store, "scout")
+        self.assertIsNone(scout.load_doc("scout"))
+        doc = {"alerts": [{"kind": "early", "title": "MARS", "price": 0.001}], "wallets": {"w1": [1, 1, 0.5, "", "MARS"]}}
+        scout.save_doc("scout", doc)
+        scout.save_doc("scout", {**doc, "updated": "now"})
+        self.assertEqual(scout.load_doc("scout"), {**doc, "updated": "now"})
+        self.assertIsNone(scout.load_hype())  # the document is not mistaken for the scout "account"
+        self.assertIsNone(PgHypeStore(self.store, "_scout").load_hype() and None)
+
 
 class RateLimitedClientTest(unittest.TestCase):
     def http(self, status):
@@ -898,7 +911,7 @@ class StartHypeTest(unittest.TestCase):
             runner.run_once()
             runner.run_once()
         self.assertEqual(runner.error, "")
-        self.assertEqual([v.id for v, _ in runner.variants], ["current", "no_repeat", "deep_pools"])
+        self.assertEqual([v.id for v, _ in runner.variants], [v.id for v in VARIANTS])
         for (v, store), base in zip(runner.variants, VARIANTS, strict=True):
             self.assertEqual(v.rules, replace(base.rules, bankroll=500.0, stake=20.0))
             self.assertEqual(v.buys_enabled, base.buys_enabled)
@@ -907,7 +920,8 @@ class StartHypeTest(unittest.TestCase):
         self.assertEqual((runner.rules.bankroll, runner.rules.stake), (500.0, 20.0))
         self.assertEqual([stores[k].account.cash for k in ("current", "no_repeat", "deep_pools")],
                          [500.0, 480.0, 500.0])
-        self.assertEqual((gecko.discovers, dex.discovers), (1, 0))  # scans: GeckoTerminal first
+        # scans: GeckoTerminal first; DexScreener's list is asked once, for the early coins
+        self.assertEqual((gecko.discovers, dex.discovers), (1, 1))
         self.assertEqual((dex.price_calls, gecko.price_calls), ([["TokA1"]], []))  # prices: DexScreener first
         self.assertEqual(runner.feed_status()["rate_limited_1h"], 0)
 

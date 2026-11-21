@@ -70,8 +70,8 @@ SCAN_AFTER = timedelta(minutes=3)  # let the opening prints settle
 SCAN_UNTIL = timedelta(minutes=15)
 HISTORY_SESSIONS = 15  # one data request per pick (marketdata.intraday.CHUNK_SESSIONS)
 DISPLAY_REFRESH = timedelta(minutes=30)
-OWN_PER_HOUR = 6  # scan + display requests in any hour: what the funds' 36 leave of the 45
-FUND_POLL = 3  # requests the three-fund bots need at their next check
+OWN_PER_HOUR = 6  # default scan + display requests in any hour (the service works its own out
+FUND_POLL = 3  # from how many funds are still polled: engine/runtime.py)
 MIN_GAP = 0.01
 MAX_GAP = 0.50  # a bigger "gap" is a split or a bad previous close, not a stock in play
 MIN_PRICE = 5.0
@@ -106,6 +106,35 @@ IN_PLAY_BOTS: tuple[BotSpec, ...] = (
                    "Passes on any stock with fewer than 10 earlier days of prices.",
                    "Safety stop at the first 15 minutes' low. Sells at the close, or earlier if "
                    "the stop is hit.")),
+)
+
+# The two fund strategies that made money before costs in the 2017-2024 history tests, moved to
+# where a day's move is several times bigger than the cost of trading it (docs/RESEARCH.md).
+IN_PLAY_BOTS += (
+    BotSpec("sip_trend", "vwap_trend", universe=UNIVERSE_ID,
+            name="Stocks in play, ride the trend",
+            summary="The same morning scan. On a stock that is climbing, it buys when the price "
+                    "dips back to the day's average price and bounces.",
+            rules=(_RULES_SCAN,
+                   "After 10 am, only while the stock is above where it opened and its average "
+                   "price for the day (VWAP) is rising.",
+                   "Buys when a 5-minute bar dips to that average but closes above it.",
+                   "Sells if the price closes clearly below the average (the trend broke), or at "
+                   "the close.",
+                   "Safety stop just under the average. Up to two trades per stock a day.")),
+    BotSpec("sip_noise", "noise", universe=UNIVERSE_ID,
+            name="Stocks in play, past normal noise",
+            summary="The same morning scan. It buys only when a stock's climb today is clearly "
+                    "bigger than its normal wobble at that time of day.",
+            rules=(_RULES_SCAN,
+                   "For every time of day, works out how far the stock usually is from its open, "
+                   "averaged over its last 14 trading days. Anything inside that is 'noise'.",
+                   "Checks every 30 minutes from 10 am. Buys when the price closes above the top "
+                   "of the noise and above the day's average price (VWAP).",
+                   "At each later check, sells if the price has dropped back below either line. "
+                   "Sells at the close at the latest.",
+                   "Emergency stop 5% down. Passes on a stock with fewer than 10 earlier days of "
+                   "prices.")),
 )
 
 QuoteFetcher = Callable[[Sequence[str]], list]
@@ -175,12 +204,16 @@ class InPlayRunner(IntradayRunner):
     def __init__(self, settings: Settings, store, fetch_rows: RowFetcher,
                  fetch_quotes: QuoteFetcher, bots: Sequence[BotSpec] = IN_PLAY_BOTS,
                  universe: Sequence[str] = IN_PLAY,
-                 budget: Callable[[], int] = lambda: 999) -> None:
+                 budget: Callable[[], int] = lambda: 999, own_per_hour: int = OWN_PER_HOUR,
+                 fund_poll: int = FUND_POLL) -> None:
         super().__init__(settings, store, fetch_rows, bots)
+        self.own_per_hour = own_per_hour  # scan + display requests allowed in any hour
+        self.fund_poll = fund_poll  # requests the fund bots need at their next check
         self.fetch_quotes = fetch_quotes
         self.universe = tuple(universe)
         self.budget = budget  # data requests that can be made right now without waiting
         self.symbols = []  # no fixed list: see symbols_on()
+        self.live_symbols = []
         self._spent: deque[datetime] = deque()  # when this runner's daytime requests were made
         self._scan_problem = ""
 
@@ -203,7 +236,7 @@ class InPlayRunner(IntradayRunner):
         and only while the three-fund bots' next poll would still go straight through."""
         while self._spent and now - self._spent[0] >= timedelta(hours=1):
             self._spent.popleft()
-        return len(self._spent) + n <= OWN_PER_HOUR and self.budget() >= n + FUND_POLL
+        return len(self._spent) + n <= self.own_per_hour and self.budget() >= n + self.fund_poll
 
     def _spend(self, n: int, now: datetime) -> None:
         self._spent.extend([now] * n)

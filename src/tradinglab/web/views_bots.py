@@ -13,9 +13,9 @@ from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from tradinglab.intraday.core import DayResult, IFill
-from tradinglab.intraday.live import DEFAULT_BOTS, BotSpec, settled
+from tradinglab.intraday.live import RETIRED, BotSpec, Retired, settled
 from tradinglab.intraday.research import TRAIN, VALIDATION, backfill_status
-from tradinglab.intraday.strategies import ALL_STRATEGIES, REGISTRY
+from tradinglab.intraday.strategies import ALL_STRATEGIES
 from tradinglab.marketdata.calendar import (
     is_trading_day,
     next_trading_day,
@@ -49,12 +49,15 @@ EXIT_WORDS = {
     "time_exit": "because the bounce hadn't happened by 1 pm",
     "back_at_average": "because the price got back to the day's average",
     "trend_broke": "because the price fell below the day's average (the trend broke)",
+    "back_inside_noise": "because the price fell back inside its normal range",
 }
 ENTRY_WORDS = {
     "breakout_above_opening_range": "it broke above the high of its opening range",
     "gap_down_open": "it opened lower than yesterday's close",
     "far_below_average": "it dropped unusually far below the day's average price",
     "bounce_off_rising_average": "it bounced off the day's rising average price",
+    "broke_above_noise": "its climb went clearly beyond its normal wobble for that time of day",
+    "up_by_10am": "it was above yesterday's close at 10 am",
     "fair_value_gap_order": "the price came back to the middle of a fair value gap",
 }
 REJECT_WORDS = {
@@ -151,9 +154,10 @@ def _sold_line(t: Any) -> str:
     return f"Sold {t.shares} {t.symbol} {_reason(t.exit_reason, EXIT_WORDS)}"
 
 
-def bot_view(state: Any, bot: BotSpec, now: datetime, runner: Any = None) -> BotView:
+def bot_view(state: Any, bot: BotSpec, now: datetime, runner: Any = None, live: bool = True) -> BotView:
+    """`live=False`: a retired bot, shown from its stored account only (no "today so far")."""
     store = state.store
-    runner = runner or state.intraday
+    runner = (runner or state.intraday) if live else None
     st = store.load_bot(bot.id)
     trades = store.bot_trades(bot.id)
     today = runner.today(bot, now) if runner is not None else None
@@ -244,6 +248,23 @@ def hype_views(state: Any, now: datetime) -> list[BotView]:
     return out
 
 
+def retired_bots(state: Any) -> list[Retired]:
+    """Retired bots that are not running here (a test or research setup may still run them)."""
+    running = {b.id for _, b in all_bots(state)}
+    return [r for r in RETIRED if r.spec.id not in running]
+
+
+def retired_views(state: Any, now: datetime) -> list[tuple[BotView, Retired]]:
+    out = []
+    for r in retired_bots(state):
+        v = bot_view(state, r.spec, now, live=False)
+        if not v.days:  # it never traded on this installation: nothing to show
+            continue
+        v.group, v.status, v.today_pnl, v.attention = "Retired", f"Retired {day_label(r.on)}", None, ""
+        out.append((v, r))
+    return out
+
+
 def bot_status(state: Any, st, today: DayResult | None, now: datetime) -> str:
     if st is None:
         return "Starting soon"
@@ -331,13 +352,27 @@ def overview_page(state: Any, now: datetime | None = None) -> str:
     except Exception as exc:  # noqa: BLE001 - never 500 the page
         return _unavailable(state, exc, "overview")
     hype = hype_views(state, now)
-    body = (f"<section class='hero'>{hero_card(views, now)}"
-            f"<div class='card'><span class='lbl'>Every stock bot, profit since it started</span>"
-            f"{theme.line_chart(_aligned(views))}</div></section>"
-            f"<section class='cols'><div class='card flush'><h2><span>Leaderboard</span>"
-            f"<span>ranked by total profit</span></h2>{board(views + hype, now)}</div>"
-            f"<div class='stack'>{feed_card(views + hype, now, state.tz)}{health_card(state)}</div>"
-            "</section>")
+    stocks = (f"<section class='hero'>{hero_card(views, now)}"
+              f"<div class='card'><span class='lbl'>Every stock bot, profit since it started</span>"
+              f"{theme.line_chart(_aligned(views))}</div></section>")
+    if hype:  # memecoins are the main event: they lead, the stock bots follow
+        hype.sort(key=lambda v: v.total, reverse=True)
+        longest = max(len(v.curve) for v in hype)
+        curves = [(v.name.removeprefix("Hype · "), [0.0] * (longest - len(v.curve)) + [x for _, x in v.curve])
+                  for v in hype]
+        body = (f"<section class='hero'>{crypto_hero(hype)}"
+                f"<div class='card'><span class='lbl'>Every memecoin rule set, profit since it started"
+                f"</span>{theme.line_chart(curves)}</div></section>"
+                f"<section class='cols'><div class='card flush'><h2><span>Leaderboard</span>"
+                f"<span>ranked by total profit</span></h2>{board(hype + views, now)}</div>"
+                f"<div class='stack'>{alerts_card(state, now)}{feed_card(hype + views, now, state.tz)}"
+                f"{health_card(state)}</div></section>"
+                f"<section><h2>Stock bots</h2></section>{stocks}")
+    else:
+        body = (stocks + f"<section class='cols'><div class='card flush'><h2><span>Leaderboard</span>"
+                f"<span>ranked by total profit</span></h2>{board(views, now)}</div>"
+                f"<div class='stack'>{feed_card(views, now, state.tz)}{health_card(state)}</div>"
+                "</section>")
     return _page(state, "Trading Lab", body, now, active="overview")
 
 
@@ -385,6 +420,42 @@ def hero_card(views: Sequence[BotView], now: datetime) -> str:
             f"<div><span class='lbl'>Best bot</span><b>{esc(best.name) if best else '—'}</b></div>"
             f"<div><span class='lbl'>Needs a look</span><b class='{'loss' if worry else 'mut'}'>"
             f"{esc(worry.name) if worry else 'Nothing'}</b></div></div></div>")
+
+
+def crypto_hero(hype: Sequence[BotView]) -> str:
+    """The memecoin accounts added up: what they are worth, what they have made, who leads."""
+    value = sum(v.value for v in hype)
+    total = sum(v.total for v in hype)
+    day = [v.today_pnl for v in hype if v.today_pnl is not None]
+    best = hype[0] if hype and hype[0].total > 0.005 else None
+    worry = next((v for v in hype if v.attention), None)
+    return (f"<div class='card'><span class='lbl'>Memecoin accounts · worth now</span>"
+            f"<div class='big'>{money(value)}</div>"
+            f"<div class='{tone_usd(total)}' style='margin-top:4px'>{signed(total)} since they started "
+            f"<span class='mut'>({len(hype)} rule sets, pretend money)</span></div><div class='kpis'>"
+            f"<div><span class='lbl'>Last 24 hours</span><b class='num {tone_usd(sum(day))}'>"
+            f"{signed(sum(day)) if day else '—'}</b></div>"
+            f"<div><span class='lbl'>Trades so far</span><b class='num'>{sum(v.trades for v in hype)}</b></div>"
+            f"<div><span class='lbl'>Best rule set</span><b>{esc(best.name.removeprefix('Hype · ')) if best else '—'}</b></div>"
+            f"<div><span class='lbl'>Needs a look</span><b class='{'loss' if worry else 'mut'}'>"
+            f"{esc(worry.name.removeprefix('Hype · ')) if worry else 'Nothing'}</b></div></div></div>")
+
+
+def alerts_card(state: Any, now: datetime, limit: int = 5) -> str:
+    """The scout's newest alerts, short form, linking to the full list."""
+    from tradinglab.web.views_hype import KIND_WORDS, scout_doc
+
+    doc = scout_doc(state)
+    if doc is None:
+        return ""
+    rows = []
+    for a in (doc.get("alerts") or [])[:limit]:
+        when = local_time(datetime.fromisoformat(a["at"]), state.tz)
+        rows.append(f"<div><time>{esc(when)} · {esc(KIND_WORDS.get(a.get('kind', ''), '').lower())}</time>"
+                    f"<b>{esc(str(a.get('title', '?')))}</b> {esc(str(a.get('text', '')))}</div>")
+    inner = "".join(rows) or "<p class='empty'>No alerts yet. The scout looks once a minute.</p>"
+    return (f"<div class='card flush feed'><h2><span>Early alerts</span><span><a href='/hype'>all "
+            f"alerts</a></span></h2>{inner}</div>")
 
 
 def board(views: Sequence[BotView], now: datetime, groups: bool = True) -> str:
@@ -493,14 +564,29 @@ def stocks_page(state: Any, now: datetime | None = None) -> str:
     try:
         views = stock_views(state, now)
         big, sub = leaderboard_headline(views, now, state)
+        retired = retired_views(state, now)
     except Exception as exc:  # noqa: BLE001
         return _unavailable(state, exc, "stocks")
     body = (f"<section><h2>The bots</h2><p class='quiet small'>Each bot has its own "
             f"{money(capital_of(state), False)} of pretend money and its own strategy. Ranked by "
             f"how much each has made or lost since it started.</p>"
-            f"<div class='card flush'>{board(views, now)}</div></section>" + rules_section(state))
+            f"<div class='card flush'>{board(views, now)}</div></section>"
+            + retired_section(retired, now) + rules_section(state))
     return _shell(state, big, sub, market_line(now, state.tz), body, title="Stocks · Trading Lab",
                   refresh=60 if market_open(now) else 0, active="stocks")
+
+
+def retired_section(retired: Sequence[tuple[BotView, Retired]], now: datetime) -> str:
+    if not retired:
+        return ""
+    why = "".join(f"<li><b>{esc(v.name)}.</b> {esc(r.why)}</li>" for v, r in retired)
+    return ("<section><h2>Retired</h2><p class='quiet small'>These stopped trading after a review "
+            "of seven years of prices. Their accounts are kept exactly as they ended, and each "
+            "one's page still shows every trade it made.</p>"
+            f"<div class='card flush'>{board([v for v, _ in retired], now, groups=False)}</div>"
+            f"<details><summary>Why each one was retired</summary><div class='how'><ul>{why}</ul>"
+            "<p class='quiet small'>The full numbers are on the History tests tab.</p></div>"
+            "</details></section>")
 
 
 def tests_page(state: Any, now: datetime | None = None) -> str:
@@ -567,13 +653,16 @@ def research_section(state: Any, now: datetime) -> str:
     end = previous_trading_day(ny_date(now))
     try:
         status = backfill_status(state.store, syms, end)
-        results = {b.id: state.store.backtest(b.id) for b in DEFAULT_BOTS}
+        gone = {r.spec.id for r in retired_bots(state)}
+        specs = ([b for _, b in all_bots(state) if getattr(b, "universe", "etf") == "etf"]
+                 + [r.spec for r in retired_bots(state)])
+        results = {b.id: state.store.backtest(b.id) for b in specs}
     except Exception:  # noqa: BLE001
         return ""
     rows = []
-    for b in DEFAULT_BOTS:
+    for b in specs:
         r = results.get(b.id)
-        name = REGISTRY[b.strategy_id].name
+        name = bot_title(b) + (" (retired)" if b.id in gone else "")
         if not r:
             continue
         cells = []
@@ -665,12 +754,17 @@ def bot_page(state: Any, bot_id: str, now: datetime | None = None) -> str | None
         from tradinglab.web.views import render_trend_page
 
         return render_trend_page(state)
-    pair = next(((r, b) for r, b in all_bots(state) if b.id == bot_id), None)
-    if pair is None or state.store is None:
+    if state.store is None:
         return None
-    runner, bot = pair
+    pair = next(((r, b) for r, b in all_bots(state) if b.id == bot_id), None)
+    gone = next((r for r in retired_bots(state) if r.spec.id == bot_id), None)
+    if pair is None and gone is None:
+        return None
+    runner, bot = pair if pair is not None else (None, gone.spec)
     name = bot_title(bot)
-    v = bot_view(state, bot, now, runner)
+    v = bot_view(state, bot, now, runner, live=gone is None)
+    if gone is not None:
+        v.status = f"Retired {day_label(gone.on)}, no longer trading"
     st = state.store.load_bot(bot.id)
     days = state.store.bot_days(bot.id)
     show_day, result = _day_to_show(state, bot, v, days, now)
@@ -688,6 +782,8 @@ started with {money(v.start_capital, False)}{(' on ' + day_label(v.started)) if 
 <div><span class='lbl'>Best day</span><b class='num'>{signed(max((d.pnl for d in days), default=0.0))}</b></div>
 </div></section>""",
     ]
+    if gone is not None:
+        parts.insert(0, f"<p class='notice'><b>Retired {esc(day_label(gone.on))}.</b> {esc(gone.why)}</p>")
     if len(v.curve) >= 2:
         parts.append("<section><h2>Profit since it started</h2><div class='card'>"
                      f"{theme.line_chart([(name, [x for _, x in v.curve])])}</div></section>")
@@ -703,7 +799,7 @@ started with {money(v.start_capital, False)}{(' on ' + day_label(v.started)) if 
 </div></details></section>""")
     if getattr(bot, "universe", "etf") != "in_play":
         parts.append(bot_research(state, bot))
-    if st is not None and st.halt_latched:
+    if st is not None and st.halt_latched and gone is None:
         parts.append(_resume_form(state, bot.id))
     return _shell(state, big, sub, market_line(now, state.tz), "".join(parts), back=name,
                   title=f"{name} · Trading Lab", refresh=60 if market_open(now) else 0)
@@ -772,7 +868,7 @@ def bot_headline(v: BotView, r: DayResult | None, d: date | None, now: datetime)
 def day_section(state: Any, bot: BotSpec, d: date, r: DayResult, now: datetime,
                 runner: Any = None) -> str:
     tz = state.tz
-    symbols = (runner.symbols_on(d) if hasattr(runner, "symbols_on")
+    symbols = (runner.symbols_for(bot, d) if hasattr(runner, "symbols_for")
                else list(state.report.settings.symbols))
     charts = []
     for sym in symbols:

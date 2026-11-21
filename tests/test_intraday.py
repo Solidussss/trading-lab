@@ -8,7 +8,14 @@ from tests.helpers import settings
 from tradinglab.engine.risk import RiskParams
 from tradinglab.engine.store import InMemoryStore
 from tradinglab.intraday.core import INTRADAY_COSTS, BotState, IntradayCore
-from tradinglab.intraday.live import DEFAULT_BOTS, BotSpec, IntradayRunner, first_session_after
+from tradinglab.intraday.live import (
+    ALL_FUND_BOTS,
+    DEFAULT_BOTS,
+    RETIRED,
+    BotSpec,
+    IntradayRunner,
+    first_session_after,
+)
 from tradinglab.intraday.research import backfill_status, backfill_step, run_history_test
 from tradinglab.intraday.strategies import (
     REGISTRY,
@@ -503,7 +510,7 @@ class FakeFeed:
         return out
 
 
-def runner_with(feed, store=None, bots=DEFAULT_BOTS):
+def runner_with(feed, store=None, bots=ALL_FUND_BOTS):
     store = store or InMemoryStore()
     from tradinglab.marketdata.bars import Bar
 
@@ -526,15 +533,15 @@ class RunnerTests(unittest.TestCase):
         rep = r.run(mid)
         self.assertEqual((rep.status, rep.requests), ("refreshed", 6))  # Friday once + today
         self.assertEqual(r.run(mid + timedelta(minutes=1)).requests, 0)  # not stale yet
-        projections = {b.id: r.today(b, mid) for b in DEFAULT_BOTS}
+        projections = {b.id: r.today(b, mid) for b in ALL_FUND_BOTS}
         self.assertTrue(all(p is not None and not p.final for p in projections.values()))
         after = at(date(2024, 3, 4), "16:25")
         feed.until = None
         rep = r.run(after)
         self.assertEqual(rep.status, "committed")
-        self.assertEqual(sorted(rep.committed), sorted((b.id, date(2024, 3, 4)) for b in DEFAULT_BOTS))
+        self.assertEqual(sorted(rep.committed), sorted((b.id, date(2024, 3, 4)) for b in ALL_FUND_BOTS))
         self.assertEqual(r.run(after + timedelta(minutes=5)).committed, [])  # no double commit
-        for b in DEFAULT_BOTS:
+        for b in ALL_FUND_BOTS:
             days = store.bot_days(b.id)
             self.assertEqual(len(days), 1)
             self.assertAlmostEqual(store.load_bot(b.id).cash, days[0].end_equity)
@@ -605,7 +612,7 @@ class RunnerTests(unittest.TestCase):
         r, store = runner_with(feed)
         r.run(datetime(2024, 3, 2, 18, tzinfo=UTC))
         feed.until = at(date(2024, 3, 5), "11:00")
-        self.assertIsNone(r.today(DEFAULT_BOTS[0], at(date(2024, 3, 5), "11:00")))
+        self.assertIsNone(r.today(ALL_FUND_BOTS[0], at(date(2024, 3, 5), "11:00")))
 
     def test_settings_change_before_any_trading_restarts_the_bot(self):
         feed = FakeFeed()
@@ -651,6 +658,62 @@ class ResearchTests(unittest.TestCase):
         # the validation result does not depend on whether the test was opened
         self.assertEqual(w["validation"], opened["orb"]["windows"]["validation"])
 
+
+
+class ActiveSetTests(unittest.TestCase):
+    """After the November 2026 review: one fund bot still trades, on two funds; six are retired."""
+
+    def test_only_the_noise_breakout_still_trades_and_only_spy_and_qqq(self):
+        self.assertEqual([(b.id, b.symbols) for b in DEFAULT_BOTS], [("noise", ("SPY", "QQQ"))])
+        self.assertEqual({r.spec.id for r in RETIRED} | {b.id for b in DEFAULT_BOTS},
+                         {b.id for b in ALL_FUND_BOTS})
+        self.assertTrue(all(len(r.why) > 60 for r in RETIRED))
+
+    def test_the_live_loop_only_fetches_and_trades_the_funds_in_use(self):
+        feed = FakeFeed()
+        r, store = runner_with(feed, bots=DEFAULT_BOTS)
+        self.assertEqual((r.symbols, r.live_symbols), (SYMS, ["SPY", "QQQ"]))
+        r.run(datetime(2024, 3, 2, 18, tzinfo=UTC))
+        mid = at(date(2024, 3, 4), "11:02")
+        feed.until = mid
+        self.assertEqual(r.run(mid).requests, 4)  # two funds, Friday once + today
+        feed.until = None
+        for d in trading_days(date(2024, 3, 4), date(2024, 3, 28)):
+            r.run(at(d, "16:30"))
+        self.assertEqual(len(store.bot_days("noise")), len(trading_days(date(2024, 3, 4), date(2024, 3, 28))))
+        self.assertTrue({t.symbol for t in store.bot_trades("noise")} <= {"SPY", "QQQ"})
+        self.assertEqual(store.ibars("IWM", date(2024, 3, 5)), [])  # left to the overnight loader
+
+    def test_a_bot_with_all_funds_fingerprints_exactly_as_before(self):
+        feed = FakeFeed()
+        r, _ = runner_with(feed)
+        import hashlib
+        import json
+        from dataclasses import asdict
+
+        bot = ALL_FUND_BOTS[0]
+        blob = {"strategy": bot.strategy().label, "symbols": SYMS, "risk": asdict(r.risk),
+                "costs": asdict(INTRADAY_COSTS), "capital": r.capital}
+        self.assertEqual(r.fingerprint(bot),
+                         hashlib.sha256(json.dumps(blob, sort_keys=True).encode()).hexdigest()[:16])
+
+    def test_history_test_uses_each_bots_own_funds(self):
+        feed = FakeFeed(end=date(2024, 12, 31))
+        end, start = date(2024, 12, 31), date(2024, 1, 2)
+        kw = dict(end=end, start=start, unlocked=lambda _b: False)
+        full, two = InMemoryStore(), InMemoryStore()
+        backfill_step(full, feed.rows, SYMS, end, 10_000, start=start)
+        backfill_step(two, feed.rows, ["SPY", "QQQ"], end, 10_000, start=start)
+        limited = run_history_test(full, [BotSpec("noise", "noise", symbols=("SPY", "QQQ"))], SYMS,
+                                   RiskParams(), 1_000_000.0, **kw)["noise"]["windows"]["validation"]
+        alone = run_history_test(two, [BotSpec("noise", "noise")], ["SPY", "QQQ"],
+                                 RiskParams(), 1_000_000.0, **kw)["noise"]["windows"]["validation"]
+        everything = run_history_test(full, [BotSpec("noise", "noise")], SYMS,
+                                      RiskParams(), 1_000_000.0, **kw)["noise"]["windows"]["validation"]
+        pick = ("days", "end_equity", "trades", "costs")
+        self.assertGreater(limited["trades"], 0)
+        self.assertEqual([limited[k] for k in pick], [alone[k] for k in pick])
+        self.assertNotEqual(limited["trades"], everything["trades"])
 
 if __name__ == "__main__":
     unittest.main()

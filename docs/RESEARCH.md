@@ -78,3 +78,52 @@ decisions and equity values up to the cutoff are byte-identical.
   modelled as resumed after 20 trading days (live, it waits for you).
 - Benchmark: buy SPY at the last close before the window and hold it (price only).
 - Strategy parameters are round numbers fixed up front; nothing has been tuned.
+
+## November 2026 review of the seven fund bots
+
+All seven day-trading bots were re-run offline on the stored 5-minute history with the live
+core, costs and limits (it reproduces the app's own history test to the dollar). The sealed
+2025+ window was not loaded. Dollars are on a $1,000,000 account.
+
+| Bot | 2017-2022 after costs | before costs | 2023-2024 after costs | before costs |
+|---|---|---|---|---|
+| Opening breakout | -163,561 (-3.2%/yr) | +26,678 | -32,776 (-2.0%/yr) | +27,396 |
+| Gap-down bounce | -109,258 (-2.1%/yr) | -37,169 | -36,775 (-2.1%/yr) | -7,500 |
+| Dip below the day's average | -147,512 (-2.9%/yr) | -9,147 | -41,006 (-2.4%/yr) | +497 |
+| Ride the day's trend | -243,921 (-5.0%/yr) | +102,265 | -94,402 (-6.5%/yr) | +2,889 |
+| Fair value gap | -144,917 (-2.9%/yr) | -33,805 | -22,172 (-1.3%/yr) | -270 |
+| Breakout past normal noise | -41,803 (-0.8%/yr) | +34,470 | -17,005 (-0.9%/yr) | +12,205 |
+| Last half-hour momentum | -131,780 (-2.6%/yr) | -37,916 | -37,496 (-2.2%/yr) | -4,228 |
+
+Simply holding over the same windows (price only): SPY +54.6% and +52.5%, QQQ +85.6% and
++90.3%, IWM +22.7% and +25.6%.
+
+What the training window (2017-2022) showed, and what was done about it:
+
+- **No bot makes money after costs, in either window.** Three have no edge even with free
+  trading (gap, fair value gap, last half-hour) and one only breaks even before costs (dip).
+  The breakout and trend bots make a little before costs, but pay three to seven times that in
+  costs: their edge is about 1 to 3 hundredths of a percent per trade against a cost of about 5.
+  This is not a parameter problem, so nothing was tuned.
+- **IWM loses before costs for six of the seven.** One change was pre-declared from the
+  training window, trade SPY and QQQ only, and then checked once on validation:
+
+  | Bot (SPY + QQQ only) | 2017-2022 after costs | 2023-2024 after costs |
+  |---|---|---|
+  | Breakout past normal noise | +2,541 (+0.05%/yr) | +2,947 (+0.15%/yr) |
+  | Opening breakout | -142,177 | -21,777 |
+  | Ride the day's trend | -169,502 | -67,892 |
+  | all seven together | -643,095 (was -982,752) | -216,594 (was -281,633) |
+
+  Only the noise breakout stops losing, and it only breaks even.
+- **Decision.** `noise` keeps trading, on SPY and QQQ. The other six are retired
+  (`intraday/live.py: RETIRED`): their accounts and trades are kept and shown, they no longer
+  trade. The two ideas with an edge before costs that are not already there (trend, noise)
+  were added to the stocks-in-play runner (`sip_trend`, `sip_noise`), where a day's move is
+  several times the cost of trading it. Those have no history test; only new days can judge them.
+- **Not done on purpose.** No search over parameters: with before-cost edges this close to
+  zero, a setting that looks good on 2017-2022 would almost certainly be noise, and every extra
+  look at 2023-2024 spends it as a check. The cost model was not loosened either. It is
+  deliberately cautious (2 hundredths of a percent a side); real costs on SPY and QQQ are lower,
+  which would move these results up a little, not turn them around.
+

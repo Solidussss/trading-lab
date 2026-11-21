@@ -2,7 +2,8 @@
 
 Private, autonomous, **simulation-only** trading research system. It runs pretend-money bots
 side by side, each with its own simulated account: seven day-trading bots on SPY, QQQ and IWM
-(5-minute prices, flat every night), one slow daily trend follower, two "stocks in play" bots
+(5-minute prices, flat every night; six of them retired in November 2026 after seven years of
+prices showed no edge after costs), one slow daily trend follower, four "stocks in play" bots
 that trade the day's busiest stocks, and three competing rule sets of a Solana memecoin hype
 bot. Stock prices come from Tiingo. There is no brokerage connection and no real-money trading
 code; see `docs/SAFETY.md`.
@@ -22,6 +23,8 @@ code; see `docs/SAFETY.md`.
 | 9 | One dashboard look (`web/theme.py`): Overview, Stocks, Crypto, History tests, Controls | ✅ |
 | 10 | Stocks in play: morning scan of ~100 stocks, opening breakouts in the top five gappers, and an odds-checked twin that replays the rest of the day before each entry | ✅ forward paper trading only (no history test) |
 | 11 | Hype bot rule sets side by side, positions priced from DexScreener first, back-off when rate-limited | ✅ |
+| 12 | Review of the seven fund bots on 2017-2024 prices: six retired, the noise breakout kept on SPY and QQQ, two of the ideas moved to stocks in play (docs/RESEARCH.md) | ✅ |
+| 13 | Memecoin scout (`hype/scout.py`): once a minute, alerts for coins still on the pump fun curve that are drawing a crowd, fresh migrations, trending subjects and whale buying; scores whale wallets itself; follows every alert's price so the page shows how the alerts did. Three more paper rule sets: follow the whales, whales with a quick exit, before they migrate. Memecoins lead the home page | ✅ on-chain data only; X/Twitter buzz and phone notifications not built yet |
 | 8 | Claude research reports (scheduled / on demand only) | |
 
 ## Architecture

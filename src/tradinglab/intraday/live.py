@@ -63,6 +63,7 @@ class BotSpec:
     name: str = ""  # shown instead of the strategy's own name, summary and rules when set
     summary: str = ""
     rules: tuple[str, ...] = ()
+    symbols: tuple[str, ...] = ()  # trade only these of the runner's funds (empty: all of them)
 
     def strategy(self) -> IntradayStrategy:
         return ALL_STRATEGIES[self.strategy_id](**self.params)
@@ -80,7 +81,53 @@ class BotSpec:
         return self.rules or tuple(ALL_STRATEGIES[self.strategy_id].rules)
 
 
-DEFAULT_BOTS: tuple[BotSpec, ...] = tuple(BotSpec(sid, sid) for sid in REGISTRY)
+# Every fund strategy as a bot: what the tests and offline research run.
+ALL_FUND_BOTS: tuple[BotSpec, ...] = tuple(BotSpec(sid, sid) for sid in REGISTRY)
+
+# The fund bots that still trade. November 2026 review (docs/RESEARCH.md): over 2017-2024 none
+# of the seven made money on SPY/QQQ/IWM after costs. Only the noise breakout held its own, and
+# only without IWM (about break-even in both windows), so it alone keeps trading, on SPY and QQQ.
+DEFAULT_BOTS: tuple[BotSpec, ...] = (
+    BotSpec("noise", "noise", symbols=("SPY", "QQQ"),
+            summary="Learns how far SPY and QQQ normally drift from their open at each time of day, "
+                    "and buys only when today's climb is clearly bigger than that normal noise. The "
+                    "only one of the original seven that did not lose money on seven years of "
+                    "prices (it roughly broke even)."),
+)
+
+
+@dataclass(frozen=True)
+class Retired:
+    """A bot that no longer trades. Its account and trades stay in the database and on its page."""
+    spec: BotSpec
+    on: date
+    why: str  # plain English, with the numbers that decided it
+
+
+_REVIEW = date(2026, 11, 20)
+RETIRED: tuple[Retired, ...] = (
+    Retired(BotSpec("orb", "orb"), _REVIEW,
+            "On seven years of prices it lost 3.2% a year (2017-2022) and 2.0% a year (2023-2024). "
+            "Before trading costs it made a little, but costs were three to seven times that. The "
+            "same idea now runs on the day's busiest stocks, where moves are bigger."),
+    Retired(BotSpec("vwap_trend", "vwap_trend"), _REVIEW,
+            "It lost 5.0% a year (2017-2022) and 6.5% a year (2023-2024): the worst of the seven. "
+            "It trades so often, with stops so close, that costs were several times anything it "
+            "made. The same idea now runs on the day's busiest stocks."),
+    Retired(BotSpec("gap", "gap"), _REVIEW,
+            "It lost 2.1% a year in both test periods, and lost money even before trading costs. "
+            "There is no edge here to tune."),
+    Retired(BotSpec("vwap_dip", "vwap_dip"), _REVIEW,
+            "It lost 2.9% a year (2017-2022) and 2.4% a year (2023-2024). Before trading costs it "
+            "only broke even, so every trade was a cost with nothing behind it."),
+    Retired(BotSpec("fvg", "fvg"), _REVIEW,
+            "It lost 2.9% a year (2017-2022) and 1.3% a year (2023-2024), and lost money even "
+            "before trading costs in the longer period."),
+    Retired(BotSpec("late_momentum", "late_momentum"), _REVIEW,
+            "It lost 2.6% a year (2017-2022) and 2.2% a year (2023-2024), and lost money even "
+            "before trading costs. Buying only (never betting on a fall), the published effect "
+            "does not show up."),
+)
 
 
 @dataclass
@@ -122,6 +169,10 @@ class IntradayRunner:
         self.fetch_rows = fetch_rows
         self.bots = list(bots)
         self.symbols = list(settings.symbols)
+        # What the live loop fetches: only the funds some bot still trades (the rest are filled
+        # in overnight by the history loader, so the tests keep their full record).
+        used = {s for b in self.bots for s in (b.symbols or self.symbols)}
+        self.live_symbols = [s for s in self.symbols if s in used] or list(self.symbols)
         self.capital = float(settings.capital_base_usd)
         self.risk = RiskParams.from_limits(settings.risk)
 
@@ -132,12 +183,17 @@ class IntradayRunner:
         answers with that morning's picks."""
         return list(self.symbols)
 
+    def symbols_for(self, bot: BotSpec, day: date) -> list[str]:
+        """What this bot trades on `day`: its own short list if it has one, else the runner's."""
+        return [s for s in self.symbols_on(day) if s in bot.symbols] if bot.symbols \
+            else self.symbols_on(day)
+
     def core(self, bot: BotSpec, symbols: Sequence[str] | None = None) -> IntradayCore:
         return IntradayCore(bot.strategy(), self.symbols if symbols is None else symbols,
                             self.risk, INTRADAY_COSTS)
 
     def fingerprint(self, bot: BotSpec) -> str:
-        blob = {"strategy": bot.strategy().label, "symbols": self.symbols,
+        blob = {"strategy": bot.strategy().label, "symbols": list(bot.symbols) or self.symbols,
                 "risk": asdict(self.risk), "costs": asdict(INTRADAY_COSTS),
                 "capital": self.capital}
         return hashlib.sha256(json.dumps(blob, sort_keys=True).encode()).hexdigest()[:16]
@@ -235,8 +291,9 @@ class IntradayRunner:
                       for d in self._days_due(st, target)})[:MAX_CATCH_UP_DAYS]
         for day in due:
             try:
-                _, prev_final = self.bars_for(previous_trading_day(day), now, report, refresh=True)
-                bars, final = self.bars_for(day, now, report, refresh=True)
+                _, prev_final = self.bars_for(previous_trading_day(day), now, report, refresh=True,
+                                              symbols=self.live_symbols)
+                bars, final = self.bars_for(day, now, report, refresh=True, symbols=self.live_symbols)
                 final = final and prev_final  # yesterday's close must be settled too
             except Exception as exc:  # provider trouble: nothing is committed, retry later
                 report.status = "data_error"
@@ -247,14 +304,15 @@ class IntradayRunner:
                 report.status = "waiting"
                 report.messages.append(f"{day}: waiting for complete 5-minute data")
                 return report
-            prev = self.prev_closes(day)
+            prev = self.prev_closes(day, self.live_symbols)
             for bot in self.bots:
                 st = states[bot.id]
                 if day not in self._days_due(st, target):
                     continue
-                result = self.core(bot).run_day(st, day, bars, prev, final=True,
-                                                paused=self.pause_fn(),
-                                                history=self.history(bot, day))
+                syms = self.symbols_for(bot, day)
+                result = self.core(bot, syms).run_day(st, day, bars, prev, final=True,
+                                                      paused=self.pause_fn(),
+                                                      history=self.history(bot, day, syms))
                 self.store.commit_bot_day(bot.id, st, result)
                 report.committed.append((bot.id, day))
             report.status = "committed"
@@ -262,8 +320,9 @@ class IntradayRunner:
         if (is_trading_day(today) and session(today).open_utc <= now and not settled(today, now)
                 and any(st.start_day and st.start_day <= today for st in states.values())):
             try:
-                self.bars_for(previous_trading_day(today), now, report, refresh=True)
-                self.bars_for(today, now, report, refresh=True)
+                self.bars_for(previous_trading_day(today), now, report, refresh=True,
+                              symbols=self.live_symbols)
+                self.bars_for(today, now, report, refresh=True, symbols=self.live_symbols)
                 if report.status == "idle":
                     report.status = "refreshed"
             except Exception as exc:  # noqa: BLE001 - display data only
@@ -324,7 +383,7 @@ class IntradayRunner:
                      else st.start_day == day)
         if not caught_up:  # an earlier day isn't committed yet: don't show a stale balance
             return None
-        syms = self.symbols_on(day)
+        syms = self.symbols_for(bot, day)
         bars = {s: [b for b in self.store.ibars(s, day) if b.end <= now] for s in syms}
         return self.core(bot, syms).run_day(
             copy.deepcopy(st), day, bars, self.prev_closes(day, syms),

@@ -24,6 +24,7 @@ from tradinglab.hype.model import Snapshot
 
 DISCOVER_TTL = 60.0  # one scan result serves every variant for a minute
 RATE_LIMIT_PAUSE = 300.0  # after a 429, don't scan through that provider for five minutes
+TRADES_TTL = 60.0  # a pool's big trades are asked for at most once a minute, for every variant
 PRICE_TTL = 8.0  # a coin's price is asked for at most once per cycle, however many variants hold it
 STATUS_WINDOW = 3600.0  # status() counts rate-limit replies over the last hour
 
@@ -40,8 +41,13 @@ class SharedFeed:
     returns epoch seconds; tests pass a fake one.
     """
 
-    def __init__(self, discover: Any, price: Any, clock: Callable[[], float] = time.time) -> None:
+    def __init__(self, discover: Any, price: Any, clock: Callable[[], float] = time.time,
+                 trades: Any = None, early: Any = None) -> None:
         self._discover, self._price, self._clock = _sources(discover), _sources(price), clock
+        self._early_src = early  # a client whose discover() lists freshly profiled/boosted coins
+        self._early: tuple[float, list[Snapshot]] | None = None
+        self._trades_src = trades  # a client with .trades(pool, min_usd), or None
+        self._trades: dict[tuple[str, int], tuple[float, list | None]] = {}
         self._found: list[Snapshot] = []  # the last good scan...
         self._found_at: float | None = None  # ...and when it was made
         self._prices: dict[str, tuple[float, Snapshot | None]] = {}  # token -> (asked at, answer)
@@ -113,6 +119,45 @@ class SharedFeed:
         if not answered:
             raise RuntimeError("; ".join(errors) or "no data sources")
         return got
+
+    # -- very new coins (before they migrate) ---------------------------------------------
+
+    def early(self) -> list[Snapshot]:
+        """Freshly profiled or boosted coins, which is where pump fun coins show up while they
+        are still on the curve. Shared for a minute; an empty list when it can't be had."""
+        now = self._clock()
+        if self._early is not None and now - self._early[0] < DISCOVER_TTL:
+            return list(self._early[1])
+        src = self._early_src
+        found: list[Snapshot] = []
+        if src is not None and self._quiet.get(id(src), (now, ""))[0] <= now:
+            try:
+                found = list(src.discover())
+            except Exception as exc:  # noqa: BLE001 - the scout simply has nothing new this minute
+                self._failed(src, exc, now, DISCOVER_TTL)
+        self._early = (now, found)
+        return list(found)
+
+    # -- big trades (whale flow) ----------------------------------------------------------
+
+    def big_trades(self, pair: str, min_usd: float) -> list | None:
+        """A pool's recent trades of `min_usd` or more, or None when they can't be had right
+        now (no trade source, the provider is rate-limiting, or the call failed). The answer,
+        including "can't", is shared for a minute."""
+        now = self._clock()
+        key = (pair, int(min_usd))
+        self._trades = {k: v for k, v in self._trades.items() if now - v[0] < TRADES_TTL}
+        if key in self._trades:
+            return self._trades[key][1]
+        src = self._trades_src
+        rows: list | None = None
+        if src is not None and self._quiet.get(id(src), (now, ""))[0] <= now:
+            try:
+                rows = list(src.trades(pair, min_usd))
+            except Exception as exc:  # noqa: BLE001 - "no whale data" is an answer the bot handles
+                self._failed(src, exc, now, TRADES_TTL)
+        self._trades[key] = (now, rows)
+        return rows
 
     # -- bookkeeping ----------------------------------------------------------------------
 

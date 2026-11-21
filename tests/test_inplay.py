@@ -9,7 +9,7 @@ from tradinglab.engine.risk import RiskParams
 from tradinglab.engine.store import InMemoryStore
 from tradinglab.intraday.core import INTRADAY_COSTS, BotState, IntradayCore
 from tradinglab.intraday.inplay import IN_PLAY_BOTS, UNIVERSE_ID, InPlayRunner, pick
-from tradinglab.intraday.live import DEFAULT_BOTS
+from tradinglab.intraday.live import ALL_FUND_BOTS
 from tradinglab.intraday.replay import replay
 from tradinglab.intraday.strategies import ALL_STRATEGIES, REGISTRY, OrbOdds
 from tradinglab.intraday.universe import IN_PLAY
@@ -144,7 +144,9 @@ class OrbOddsTests(unittest.TestCase):
     def test_it_never_joins_the_three_fund_bots(self):
         self.assertNotIn("orb_odds", REGISTRY)
         self.assertIn("orb_odds", ALL_STRATEGIES)
-        self.assertFalse({b.id for b in DEFAULT_BOTS} & {b.id for b in IN_PLAY_BOTS})
+        self.assertFalse({b.id for b in ALL_FUND_BOTS} & {b.id for b in IN_PLAY_BOTS})
+        self.assertEqual([b.id for b in IN_PLAY_BOTS], ["sip", "sip_odds", "sip_trend", "sip_noise"])
+        self.assertTrue(all(b.universe == "in_play" for b in IN_PLAY_BOTS))
 
 
 class Feed:
@@ -205,7 +207,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIsNotNone(r.today(IN_PLAY_BOTS[0], at(MON, "11:00")))
 
         rep = r.run(at(MON, "16:30"))
-        self.assertEqual(sorted(rep.committed), [("sip", MON), ("sip_odds", MON)])
+        self.assertEqual(sorted(rep.committed), sorted((b.id, MON) for b in IN_PLAY_BOTS))
         for bot in ("sip", "sip_odds"):
             days = store.bot_days(bot)
             self.assertEqual([d.day for d in days], [MON])
@@ -216,7 +218,7 @@ class RunnerTests(unittest.TestCase):
         r, store, feed = make()
         r.run(datetime(2024, 3, 2, 18, tzinfo=UTC))
         rep = r.run(at(MON, "16:30"))  # the service was down all morning
-        self.assertEqual(sorted(rep.committed), [("sip", MON), ("sip_odds", MON)])
+        self.assertEqual(sorted(rep.committed), sorted((b.id, MON) for b in IN_PLAY_BOTS))
         self.assertEqual(feed.quote_calls, 0)
         self.assertEqual(store.picks(UNIVERSE_ID, MON)["picks"], [])
         self.assertIn("did not run", store.picks(UNIVERSE_ID, MON)["note"])
@@ -262,7 +264,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual((rep.status, rep.committed, feed.row_calls), ("waiting", [], 0))
         free[0] = 45
         rep = r.run(at(MON, "16:45"))
-        self.assertEqual(sorted(rep.committed), [("sip", MON), ("sip_odds", MON)])
+        self.assertEqual(sorted(rep.committed), sorted((b.id, MON) for b in IN_PLAY_BOTS))
         self.assertGreater(feed.row_calls, 0)
 
     def test_daytime_requests_stay_inside_the_hourly_allowance(self):
@@ -281,8 +283,10 @@ class RunnerTests(unittest.TestCase):
     def test_the_scan_always_comes_before_the_first_possible_signal(self):
         from tradinglab.intraday.inplay import SCAN_UNTIL
 
-        for bot in IN_PLAY_BOTS:
-            self.assertLessEqual(SCAN_UNTIL, timedelta(minutes=bot.strategy().params["range_minutes"]))
+        for bot in IN_PLAY_BOTS:  # each strategy's first decision is no earlier than this
+            params = bot.strategy().params
+            first = params.get("range_minutes", params.get("start_minutes"))
+            self.assertLessEqual(SCAN_UNTIL, timedelta(minutes=first), bot.id)
         r, store, feed = make()
         r.run(datetime(2024, 3, 2, 18, tzinfo=UTC))
         r.run(at(MON, "09:46"))  # one minute late: the day is sat out, not picked with hindsight
@@ -337,7 +341,7 @@ class RunnerTests(unittest.TestCase):
         rep = r.run(at(MON, "16:30"))
         self.assertEqual((rep.status, rep.committed), ("data_error", []))  # retried for a while
         rep = r.run(at(MON, "16:30") + timedelta(hours=3))
-        self.assertEqual(sorted(rep.committed), [("sip", MON), ("sip_odds", MON)])
+        self.assertEqual(sorted(rep.committed), sorted((b.id, MON) for b in IN_PLAY_BOTS))
         self.assertIn("BBB", store.bot_days("sip")[0].excluded)
 
     def test_resuming_a_bot_takes_the_same_lock_as_its_runs(self):

@@ -23,7 +23,7 @@ import urllib.request
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
-from tradinglab.hype.model import Snapshot
+from tradinglab.hype.model import PUMP_CURVE, Snapshot, curve_liquidity
 from tradinglab.marketdata.tiingo import RateLimiter
 from tradinglab.safety.endpoints import CRYPTO_DATA_URL
 from tradinglab.safety.network_guard import install_network_guard, policy
@@ -84,13 +84,19 @@ def parse_pair(pair: dict, now_ms: int) -> Snapshot | None:
     info = pair.get("info") or {}
     created = pair.get("pairCreatedAt")
     age_min = (now_ms - int(created)) / 60000 if isinstance(created, (int, float)) and created > 0 else None
+    dex = str(pair.get("dexId") or "")
+    cap = _f(pair.get("marketCap")) or _f(pair.get("fdv")) or 0.0
+    native = _f(pair.get("priceNative"))
+    quoted_in_sol = str((pair.get("quoteToken") or {}).get("symbol") or "").upper() == "SOL"
+    sol_usd = price / native if quoted_in_sol and native and native > 0 else 0.0
+    liquidity = _f((pair.get("liquidity") or {}).get("usd")) or 0.0
+    if liquidity <= 0 and dex == PUMP_CURVE:  # a pump fun curve reports no pool: work it out
+        liquidity = curve_liquidity(cap, sol_usd)
     return Snapshot(
         token=str(addr), symbol=str(base.get("symbol") or "?")[:20], name=str(base.get("name") or "")[:60],
-        pair=str(pair.get("pairAddress") or ""), dex=str(pair.get("dexId") or ""),
-        url=str(pair.get("url") or ""), price=price,
-        liquidity=_f((pair.get("liquidity") or {}).get("usd")) or 0.0,
-        market_cap=_f(pair.get("marketCap")) or _f(pair.get("fdv")) or 0.0,
-        age_min=age_min,
+        pair=str(pair.get("pairAddress") or ""), dex=dex,
+        url=str(pair.get("url") or ""), price=price, liquidity=liquidity, market_cap=cap,
+        age_min=age_min, sol_usd=sol_usd,
         buys_5m=int(_f(tx.get("buys")) or 0), sells_5m=int(_f(tx.get("sells")) or 0),
         buys_1h=int(_f(tx_h1.get("buys")) or 0), sells_1h=int(_f(tx_h1.get("sells")) or 0),
         vol_5m=_f(vol.get("m5")) or 0.0, vol_1h=_f(vol.get("h1")) or 0.0,

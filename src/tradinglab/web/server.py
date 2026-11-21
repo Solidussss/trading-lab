@@ -328,7 +328,7 @@ def start_hype(state: AppState, settings: Any, env: Mapping[str, str]) -> None:
         gecko, dex = GeckoTerminalClient(), DexScreenerClient()
         # New coins: GeckoTerminal first. Open positions: DexScreener first, so a rate-limited
         # scan feed can't stop the stops from being checked. One feed serves every variant.
-        feed = SharedFeed(discover=(gecko, dex), price=(dex, gecko))
+        feed = SharedFeed(discover=(gecko, dex), price=(dex, gecko), trades=gecko, early=dex)
 
         def bots() -> list[HypeBot]:
             pg = postgres_store(settings)  # the bot thread's own connection
@@ -336,8 +336,12 @@ def start_hype(state: AppState, settings: Any, env: Mapping[str, str]) -> None:
                     for v in variants]
 
         # the pages read each account through the dashboard's connection
+        from tradinglab.hype.scout import Scout
+
         runner = HypeRunner(bots, variants=[(v, PgHypeStore(state.store, v.id)) for v in variants],
-                            feed=feed)
+                            feed=feed,
+                            scout_factory=lambda: Scout(feed, PgHypeStore(postgres_store(settings), "scout")),
+                            scout_store=PgHypeStore(state.store, "scout"))
         state.hype = runner
         runner.start()
         log.info("hype paper bots started: %s ($%.0f bankroll each, $%.0f per coin)",

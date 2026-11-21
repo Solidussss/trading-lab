@@ -145,6 +145,18 @@ class GeckoTerminalClient:
             raise MarketDataError(failed)
         return list(best.values())
 
+    def trades(self, pair: str, min_usd: float) -> list[dict]:
+        """The pool's recent trades of at least `min_usd` dollars (up to 300 from the last day),
+        newest first: each has kind (buy/sell), volume_in_usd, tx_from_address (the wallet) and
+        block_timestamp. Read-only, like everything here."""
+        if not pair.isalnum():
+            raise MarketDataError("not a pool address")
+        payload = self._get_json(f"/networks/{NETWORK}/pools/{pair}/trades"
+                                 f"?trade_volume_in_usd_greater_than={int(min_usd)}")
+        rows = payload.get("data") if isinstance(payload, dict) else None
+        return [r["attributes"] for r in rows or []
+                if isinstance(r, dict) and isinstance(r.get("attributes"), dict)]
+
     def snapshots(self, tokens: Iterable[str], pairs: dict[str, str] | None = None) -> dict[str, Snapshot]:
         """Re-price held tokens by their pool address (`pairs` maps token -> pool)."""
         pairs = pairs or {}

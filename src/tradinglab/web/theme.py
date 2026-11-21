@@ -18,7 +18,7 @@ FONTS = ("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;60
          "&family=IBM+Plex+Sans:wght@400;500;600&display=swap")
 
 # (key, label, href)
-TABS = (("overview", "Overview", "/"), ("stocks", "Stocks", "/stocks"), ("crypto", "Crypto", "/hype"),
+TABS = (("overview", "Overview", "/"), ("crypto", "Memecoins", "/hype"), ("stocks", "Stocks", "/stocks"),
         ("tests", "History tests", "/tests"), ("controls", "Controls", "/controls"))
 
 # Line colours for the "every bot" chart: the leader is bright, the rest step down.

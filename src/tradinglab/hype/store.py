@@ -69,6 +69,19 @@ class PgHypeStore:
                             (t.token, t.symbol, t.url, t.opened, t.closed, t.stake, t.proceeds,
                              t.reason, t.why, t.peak_gain, self.account))
 
+    # A small JSON document kept beside the accounts (the scout's alerts and wallet records).
+    # Same table and statements as an account; the key is prefixed so it can't be one.
+    def load_doc(self, key: str) -> dict | None:
+        rows = self.pg._query("SELECT payload FROM hype_accounts WHERE id = %s", ("_" + key,))
+        return json.loads(rows[0][0]) if rows else None
+
+    def save_doc(self, key: str, doc: dict) -> None:
+        payload = json.dumps(doc, separators=(",", ":"))
+        with self.pg._tx() as cur:
+            cur.execute("INSERT INTO hype_accounts (id, payload, updated_at) VALUES (%s, %s, now()) "
+                        "ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, updated_at = now()",
+                        ("_" + key, payload))
+
     def hype_trades(self, n: int = 200) -> list[Trade]:
         rows = self.pg._query("SELECT token, symbol, url, opened, closed, stake, proceeds, reason, why, "
                               "peak_gain FROM hype_trades WHERE account = %s ORDER BY id DESC LIMIT %s",

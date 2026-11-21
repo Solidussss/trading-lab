@@ -32,6 +32,7 @@ from tradinglab.hype.model import (
     score,
     sell_fill,
 )
+from tradinglab.hype.whales import Flow, big_size, flow
 
 log = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ SUMMARY_EVERY = 60  # log what the scan saw every 60th cycle (~10 min); a multip
 WATCH_SIZE = 12
 
 
+WHALE_EXIT_EVERY = 12  # cycles between whale-flow checks on a held coin (~2 minutes)
 MISSING_LIMIT = 9  # checks in a row (~90 s) with no data before a pool counts as pulled
 
 
@@ -102,6 +104,15 @@ class MemoryHypeStore:
 
     def hype_trades(self, n: int = 200) -> list[Trade]:
         return list(reversed(self.trades))[:n]
+
+    def load_doc(self, key: str) -> dict | None:
+        doc = getattr(self, "_docs", {}).get(key)
+        return json.loads(json.dumps(doc)) if doc is not None else None
+
+    def save_doc(self, key: str, doc: dict) -> None:
+        if not hasattr(self, "_docs"):
+            self._docs: dict[str, dict] = {}
+        self._docs[key] = json.loads(json.dumps(doc))
 
     def hype_stats(self) -> tuple[int, int, float, float, float]:
         pnls = [t.pnl for t in self.trades]
@@ -200,6 +211,11 @@ class HypeBot:
                     log.info("%s: took half of %s at %+.0f%% (+$%.2f)", self.tag, p.symbol,
                              p.gain() * 100, got)
             reason = exit_check(p, s, now, self.rules)
+            if (reason is None and s is not None and self.rules.whale_min_usd > 0
+                    and acct.cycles % WHALE_EXIT_EVERY == 0):
+                whales = self._flow(p.pair, now, s.liquidity)  # about every two minutes per held coin
+                if whales is not None and whales.selling(self.rules.whale_ratio):
+                    reason = "whales selling"
             if reason is None:
                 keep.append(p)
                 continue
@@ -223,20 +239,38 @@ class HypeBot:
     def _scan(self, acct: Account, now: datetime) -> None:
         acct.cooldown = {t: u for t, u in acct.cooldown.items() if datetime.fromisoformat(u) > now}
         held = {p.token for p in acct.positions}
-        ranked = sorted((s for s in self.source.discover() if s.token not in held), key=score, reverse=True)
+        # a "before they migrate" rule set looks at the early list instead of the trending one
+        found = ([s for s in self.source.early() if s.pre_migration] if self.rules.stage == "pre"
+                 else self.source.discover())
+        ranked = sorted((s for s in found if s.token not in held), key=score, reverse=True)
         paused = not self.buys_enabled or bool(acct.paused)
         banned = set(acct.banned) if self.rules.no_repeat_losers else set()
-        watch, bought = [], 0
+        watch, bought, looked = [], 0, 0
+        stake = self._stake(acct)
         for s in ranked:
             # reasons about this account come first so the page shows them, then the coin's own
             no = (["paused"] if paused else []) + (["lost on it before"] if s.token in banned else [])
             no += entry_check(s, self.rules)
             if s.token in acct.cooldown:
                 no.append("traded recently (cooldown)")
-            can_buy = (not no and len(acct.positions) < self.rules.max_open
-                       and bought < self.rules.max_new_per_cycle and acct.cash >= self.rules.stake)
+            room = (len(acct.positions) < self.rules.max_open
+                    and bought < self.rules.max_new_per_cycle and acct.cash >= stake)
+            whales = None
+            if not no and room and self.rules.whale_min_usd > 0:
+                # the last gate, and the only one that costs a data request: asked for the best
+                # few coins that pass everything else
+                if looked >= self.rules.whale_checks:
+                    no.append("whales not checked this scan")
+                else:
+                    looked += 1
+                    whales = self._flow(s.pair, now, s.liquidity)
+                    if whales is None:
+                        no.append("no whale data right now")
+                    elif not whales.buying(self.rules.whale_min_buyers, self.rules.whale_ratio):
+                        no.append(f"whales aren't buying ({whales.words()})")
+            can_buy = not no and room
             if can_buy:
-                self._buy(acct, s, now)
+                self._buy(acct, s, now, stake, whales)
                 bought += 1
             elif not no:
                 no.append("no free slot" if len(acct.positions) >= self.rules.max_open else "no cash")
@@ -256,11 +290,29 @@ class HypeBot:
             log.info("%s scan: %d coins, %d bought, best score %.0f; skipped for: %s", self.tag,
                      len(ranked), bought, score(ranked[0]) if ranked else 0, top or "-")
 
-    def _buy(self, acct: Account, s: Snapshot, now: datetime) -> None:
-        stake = self.rules.stake
+    def _stake(self, acct: Account) -> float:
+        """Dollars per coin: the fixed stake, or a share of what the account is worth now."""
+        if self.rules.stake_pct <= 0:
+            return self.rules.stake
+        return round(max(equity(acct, self.rules) * self.rules.stake_pct, 1.0), 2)
+
+    def _flow(self, pair: str, now: datetime, liquidity: float) -> Flow | None:
+        """What the whales did in this pool lately, or None when the data can't be had."""
+        size = big_size(liquidity, floor=self.rules.whale_min_usd)
+        ask = getattr(self.source, "big_trades", None)
+        rows = ask(pair, size) if ask is not None and pair else None
+        if rows is None:
+            return None
+        return flow(rows, now, self.rules.whale_window_min, size)
+
+    def _buy(self, acct: Account, s: Snapshot, now: datetime, stake: float | None = None,
+             whales: Flow | None = None) -> None:
+        stake = self.rules.stake if stake is None else stake
         eff, qty = buy_fill(s.price, stake, s.liquidity, self.rules)
         why = (f"score {score(s):.0f}: {s.buy_ratio:.0%} buys, volume {s.vol_accel:.1f}x normal, "
                f"+{s.chg_5m:.0f}% in 5 min, ${s.liquidity:,.0f} pool")
+        if whales is not None:
+            why = f"{whales.words()} in {self.rules.whale_window_min:.0f} min; " + why
         acct.cash -= stake
         acct.positions.append(Position(
             token=s.token, symbol=s.symbol, url=s.url, opened=_iso(now), stake=stake, qty=qty,
@@ -285,13 +337,16 @@ class HypeRunner(threading.Thread):
     """
 
     def __init__(self, bots_factory: Callable[[], Sequence[HypeBot]], interval: float = CYCLE_SECONDS, *,
-                 variants: Sequence[tuple[Variant, Any]] = (), feed: Any = None) -> None:
+                 variants: Sequence[tuple[Variant, Any]] = (), feed: Any = None,
+                 scout_factory: Callable[[], Any] | None = None, scout_store: Any = None) -> None:
         super().__init__(name="hype-bot", daemon=True)
         self._factory, self._interval = bots_factory, interval
         self._halt = threading.Event()
         self.bots: list[HypeBot] = []
         self.variants: list[tuple[Variant, Any]] = list(variants)
         self.feed = feed
+        self._scout_factory, self.scout, self._cycles = scout_factory, None, 0
+        self.scout_store = scout_store  # where the pages read the scout's alerts from
         current = next((pair for pair in self.variants if pair[0].id == "current"),
                        self.variants[0] if self.variants else None)
         self.store: Any = current[1] if current else None
@@ -322,6 +377,20 @@ class HypeRunner(threading.Thread):
         self.error = "; ".join(errors)[:300]
         if errors:
             self.bots = []  # rebuild (e.g. fresh DB connection) next time
+            self.scout = None
+        self._cycles += 1
+        if self._scout_factory is not None and self._cycles % SCAN_EVERY == 1:
+            try:  # the early-warning scout: once a minute, never in the bots' way
+                if self.scout is None:
+                    self.scout = self._scout_factory()
+                self.scout.step()
+            except Exception:  # noqa: BLE001
+                log.exception("scout failed")
+                self.scout = None
+
+    def scout_doc(self) -> dict | None:
+        """The scout's alerts and wallet records, for the pages (None when there is no scout)."""
+        return self.scout_store.load_doc("scout") if self.scout_store is not None else None
 
     def feed_status(self) -> dict[str, Any]:
         """The shared feed's health: rate_limited_1h, last_ok and last_error."""

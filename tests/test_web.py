@@ -273,6 +273,39 @@ class BotDashboardTests(unittest.TestCase):
         for b in ("orb", "gap", "vwap_dip", "vwap_trend"):
             self.assertIn(f"href='/bot/{b}'", body)
 
+    def test_retired_bots_keep_their_pages_and_say_why(self):
+        from tests.test_intraday import runner_with
+        from tradinglab.intraday.live import DEFAULT_BOTS, RETIRED
+
+        live, _ = runner_with(self.feed, store=self.store, bots=DEFAULT_BOTS)
+        base = valid_env(DASHBOARD_PASSWORD=PASSWORD, TIINGO_API_TOKEN=FAKE_TIINGO_TOKEN)
+        state = AppState(base, freeze=False, system_proxies=dict, store=self.store, controls=object())
+        state.intraday = live
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(state))
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        port = httpd.server_address[1]
+        _, stocks, _ = WebTests.get(self, port, "/stocks", password=PASSWORD)
+        self.assertIn("Retired", stocks)
+        self.assertIn("Why each one was retired", stocks)
+        for r in RETIRED:
+            self.assertIn(f"href='/bot/{r.spec.id}'", stocks)
+        self.assertIn("href='/bot/noise'", stocks)
+        _, home, _ = WebTests.get(self, port, "/", password=PASSWORD)
+        self.assertNotIn("href='/bot/orb'", home)  # the overview is about bots that trade
+        self.assertIn("href='/bot/noise'", home)
+        status, page, _ = WebTests.get(self, port, "/bot/orb", password=PASSWORD)
+        self.assertEqual(status, 200)
+        self.assertIn("Retired", page)
+        self.assertIn("lost 3.2% a year", page)
+        self.assertIn("Day by day", page)  # its history is still there
+        self.assertNotIn("Resume this bot", page)
+        self.store.save_backtest("orb", {"windows": {}})
+        _, tests, _ = WebTests.get(self, port, "/tests", password=PASSWORD)
+        self.assertIn("Opening breakout (retired)", tests)
+        self.assertEqual(DashboardTests.post(self, port, f"action=resume_bot:orb&csrf={state.csrf}"), 400)
+
     def test_bot_page_explains_each_trade(self):
         port, _ = self.start()
         for bot in ("orb", "gap", "vwap_dip", "vwap_trend"):

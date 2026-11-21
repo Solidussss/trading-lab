@@ -57,12 +57,23 @@ def build_intraday(settings: Settings, store: PostgresStore) -> IntradayRunner:
     return IntradayRunner(settings, store, client.iex_rows, DEFAULT_BOTS)
 
 
+def inplay_allowance(fund_symbols: int, limit: int | None = None) -> tuple[int, int]:
+    """(requests the stocks-in-play runner may make per hour in the daytime, requests the fund
+    bots need per check). The fund bots poll each fund every 5 minutes (12 an hour); the
+    stocks in play get what is left of the hourly limit, less a margin of 3, and at least 3."""
+    limit = SHARED_LIMITER.max_calls if limit is None else limit
+    return max(3, limit - 3 - 12 * fund_symbols), fund_symbols
+
+
 def build_inplay(settings: Settings, store: PostgresStore) -> InPlayRunner:
     client = TiingoClient(settings.require_data_token())
+    funds = IntradayRunner(settings, store, client.iex_rows, DEFAULT_BOTS).live_symbols
+    own, poll = inplay_allowance(len(funds))
     return InPlayRunner(
         settings, store, client.iex_rows, client.iex_quotes,
         # requests that would go through right now without the limiter making anyone wait
-        budget=lambda: SHARED_LIMITER.max_calls - SHARED_LIMITER.used())
+        budget=lambda: SHARED_LIMITER.max_calls - SHARED_LIMITER.used(),
+        own_per_hour=own, fund_poll=poll)
 
 
 def market_busy(now: datetime) -> bool:

@@ -10,6 +10,7 @@ from typing import Any
 
 from tradinglab.hype.bot import equity
 from tradinglab.hype.model import Account, Rules, sell_fill
+from tradinglab.hype.scout import Scout, summary
 from tradinglab.web import theme
 
 esc = html.escape
@@ -64,6 +65,22 @@ CSS = """
 .hy .foot{font-size:11px;color:var(--dim);text-align:center;margin-top:22px}
 .hy .warn{background:var(--dnbg);color:var(--dn);border-radius:8px;padding:9px 12px;font-size:12px;margin-top:12px}
 .hy .hold{background:var(--panel);border:1px solid var(--line);border-left:3px solid var(--amber);border-radius:6px;padding:9px 12px;font-size:13px;margin-top:12px}
+.hy .al{display:block;padding:11px 13px;border-top:1px solid var(--line)}
+.hy .al:first-child{border-top:0}
+.hy .al .hd{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.hy .al .hd b{font-weight:500;font-size:15px}
+.hy .al .hd time{margin-left:auto;font-size:11px;color:var(--dim)}
+.hy .al p{font-size:13px;color:var(--mut);margin-top:3px}
+.hy .al .ft{display:flex;gap:12px;flex-wrap:wrap;font-size:12px;margin-top:6px;color:var(--mut)}
+.hy .al .ft a{color:var(--txt);text-decoration:none;border-bottom:1px solid var(--line)}
+.hy .kind{font:600 10px/1 var(--mono);letter-spacing:.06em;padding:3px 6px;border-radius:4px;background:var(--panel2);color:var(--amber)}
+.hy .kind.whales,.hy .kind.smart{color:var(--blue)} .hy .kind.theme{color:var(--mut)}
+.hy .rec{display:flex;gap:6px 18px;flex-wrap:wrap;font-size:12px;color:var(--mut);margin:0 0 10px}
+.hy .rec b{color:var(--txt);font-weight:500}
+.hy table.wl{width:100%;border-collapse:collapse;font-size:13px}
+.hy table.wl th,.hy table.wl td{text-align:left;padding:9px 13px;border-top:1px solid var(--line)}
+.hy table.wl thead th{border-top:0;font:500 11px/1.3 var(--sans);color:var(--dim);letter-spacing:.06em;text-transform:uppercase}
+.hy table.wl a{color:var(--txt);text-decoration:none;border-bottom:1px solid var(--line)}
 @media(max-width:560px){.hy .tiles{grid-template-columns:repeat(2,1fr)}.hy .value{font-size:34px}
 .hy .cells .hide{display:none}.hy .spark{width:64px}}
 """
@@ -241,6 +258,84 @@ def _compare(rows: list[tuple[str, str, str, Rules, bool, Any]], chosen: str) ->
     return f"<div class='vs'>{''.join(cards)}</div>"
 
 
+KIND_WORDS = {"early": "BEFORE MIGRATION", "migrated": "JUST MIGRATED", "theme": "TRENDING SUBJECT",
+              "whales": "WHALES BUYING", "smart": "PROVEN WALLET"}
+
+
+def scout_doc(state: Any) -> dict | None:
+    """The scout's alerts and wallet records, or None (no scout, or it can't be read)."""
+    runner = getattr(state, "hype", None)
+    read = getattr(runner, "scout_doc", None)
+    if read is None:
+        return None
+    try:
+        return read()
+    except Exception:  # noqa: BLE001 - the page still shows the accounts
+        return None
+
+
+def alert_row(a: dict, now: datetime) -> str:
+    kind = str(a.get("kind", ""))
+    moved = ""
+    if kind != "theme" and a.get("price"):
+        last, best = a.get("last", a["price"]) / a["price"] - 1, a.get("peak", a["price"]) / a["price"] - 1
+        moved = (f"<span>since the alert <b class='num {_cls(last)}'>{_pct(last, 0)}</b></span>"
+                 f"<span>best <b class='num {_cls(best)}'>{_pct(best, 0)}</b></span>")
+    where = "".join(f"<a href='{esc(url)}' target='_blank' rel='noopener noreferrer'>{esc(name)}</a>"
+                    for name, url in (a.get("links") or {}).items()
+                    if str(url).startswith("https://"))
+    return (f"<div class='al'><div class='hd'><span class='kind {esc(kind)}'>"
+            f"{esc(KIND_WORDS.get(kind, kind.upper()))}</span><b>{esc(str(a.get('title', '?')))}</b>"
+            f"<span class='num mut'>score {float(a.get('score', 0)):.0f}</span>"
+            f"<time>{esc(_ago(a['at'], now))} ago</time></div><p>{esc(str(a.get('text', '')))}</p>"
+            f"<div class='ft'>{moved}{where}</div></div>")
+
+
+def alerts_section(doc: dict | None, now: datetime, limit: int = 12) -> str:
+    """The scout's latest alerts, with how each has done since, and the day's record by kind."""
+    if doc is None:
+        return ""
+    alerts = doc.get("alerts") or []
+    record = "".join(
+        f"<span>{esc(KIND_WORDS.get(k, k).lower())}: <b>{v['n']}</b> alerts, <b>{v['ran']}</b> went up 20%+, "
+        f"now <b class='num {_cls(v['now'])}'>{_pct(v['now'], 0)}</b> on average</span>"
+        for k, v in sorted(summary(doc, now).items()))
+    if not alerts:
+        body = ("<div class='empty'>No alerts yet. The scout looks once a minute for pump fun coins "
+                "drawing a crowd, fresh migrations, trending subjects and whale buying.</div>")
+    else:
+        body = "<div class='list'>" + "".join(alert_row(a, now) for a in alerts[:limit]) + "</div>"
+    note = (f"<div class='warn'>The scout had trouble on its last look: {esc(doc['error'])}</div>"
+            if doc.get("error") else "")
+    return (f"<h2>Alerts <span>{len(alerts)} kept · newest first</span></h2>"
+            + (f"<p class='rec'>Last 24 hours: {record}</p>" if record else "") + body + note
+            + "<p class='foot'>An alert is a heads-up, not a tip: most new coins fall. The record "
+              "above is how these alerts have actually done.</p>")
+
+
+def wallets_section(doc: dict | None, limit: int = 10) -> str:
+    """Whale wallets the scout has scored itself: big buys it saw, and how many went up."""
+    if doc is None:
+        return ""
+    proven = Scout.smart_wallets(doc)
+    scored = sorted(((w, r) for w, r in (doc.get("wallets") or {}).items() if r[0] >= 3),
+                    key=lambda kv: (kv[1][1] / kv[1][0], kv[1][0]), reverse=True)[:limit]
+    if not scored:
+        return ("<h2>Whale wallets <span>found by the scout</span></h2><div class='empty'>Still "
+                f"learning. {len(doc.get('wallets') or {})} wallets seen so far; a wallet is listed "
+                "after three of its big buys have been scored (an hour after each).</div>")
+    rows = "".join(
+        f"<tr><td><a href='https://solscan.io/account/{esc(w)}' target='_blank' rel='noopener noreferrer'>"
+        f"{esc(w[:4])}…{esc(w[-4:])}</a>{' <span class=\'tag\'>PROVEN</span>' if w in proven else ''}</td>"
+        f"<td class='num'>{r[1]} of {r[0]}</td><td class='num {_cls(r[2])}'>{_pct(r[2] / r[0], 0)}</td>"
+        f"<td>{esc(str(r[4]))}</td></tr>" for w, r in scored)
+    return ("<h2>Whale wallets <span>found by the scout</span></h2><div class='list'><table class='wl'>"
+            "<thead><tr><th>Wallet</th><th>Big buys that rose 20%+</th><th>Average after an hour</th>"
+            f"<th>Last coin</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            "<p class='foot'>\"Proven\" means at least five scored buys with three in five up. "
+            "A proven wallet buying raises its own alert.</p>")
+
+
 def hype_page(state: Any, now: datetime | None = None, account: str = "") -> str:
     now = now or datetime.now(UTC)
     runner = getattr(state, "hype", None)
@@ -253,7 +348,8 @@ def hype_page(state: Any, now: datetime | None = None, account: str = "") -> str
     if account not in ids:  # default: the first rule set that is still buying
         account = next((r[0] for r in rows if r[4]), ids[0])
     vid, name, blurb, rules, buys, store = rows[ids.index(account)]
-    compare = _compare(rows, vid)
+    doc = scout_doc(state)
+    compare = _compare(rows, vid) + alerts_section(doc, now)
     try:
         acct: Account | None = store.load_hype()
         trades = store.hype_trades(60)
@@ -312,8 +408,18 @@ def hype_page(state: Any, now: datetime | None = None, account: str = "") -> str
     history = ("<div class='list'>" + "".join(_trade_row(t, now) for t in trades[:30]) + "</div>") if trades \
         else "<div class='empty'>No closed trades yet.</div>"
     extra = ""
+    if getattr(rules, "stage", "") == "pre":
+        extra += ("<li><b>Only coins still on pump fun</b>, before they migrate, found through "
+                  "DexScreener's fresh profiles and boosts.</li>")
+    if getattr(rules, "whale_min_usd", 0) > 0:
+        extra += (f"<li><b>Needs whales:</b> at least {rules.whale_min_buyers} different wallets must "
+                  f"each have made a big buy (1% of the pool, at least ${rules.whale_min_usd:,.0f}) in the last "
+                  f"{rules.whale_window_min:.0f} minutes, with twice as much bought as sold. It "
+                  "sells when the whales turn to selling.</li>")
+    if getattr(rules, "stake_pct", 0) > 0:
+        extra += f"<li><b>Bets {rules.stake_pct:.0%} of the account</b> per coin, not a fixed amount.</li>"
     if getattr(rules, "no_repeat_losers", False):
-        extra = "<li><b>Never re-buys</b> a coin it has lost money on.</li>"
+        extra += "<li><b>Never re-buys</b> a coin it has lost money on.</li>"
 
     rules_html = f"""<details><summary>How this rule set trades</summary><ul>
 <li><b>Scans</b> the trending and newest Solana pools every minute and scores each coin 0–100 on buy
@@ -332,6 +438,6 @@ platform fee + pool fee each way, price impact from pool depth, network fees. A 
     body = (compare + _live(live, "" if ok else "bad") + hero + tiles
             + f"<h2>Positions <span>{len(acct.positions)} open</span></h2>" + positions
             + f"<h2>Hot right now <span>last scan · {len(acct.watch)} coins</span></h2>" + radar
-            + f"<h2>History <span>{n} closed</span></h2>" + history + rules_html
+            + f"<h2>History <span>{n} closed</span></h2>" + history + wallets_section(doc) + rules_html
             + f"<p class='foot'>Prices from DexScreener and GeckoTerminal · refreshes every 30s · {now.strftime('%H:%M UTC')}</p>")
     return _page(state, body, now)

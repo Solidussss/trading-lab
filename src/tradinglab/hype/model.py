@@ -13,8 +13,33 @@ What it models, and why it is pessimistic on purpose:
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
+
+# pump fun starts every coin on a fixed price curve ("bonding curve") and moves it to a normal
+# trading pool ("migrates") once buyers have put in about 85 SOL. On that curve
+# (virtual SOL)^2 = market cap in SOL x PUMP_K, starting from 30 virtual SOL. These are the
+# long-standing public parameters; treat anything computed from them as approximate.
+PUMP_CURVE = "pumpfun"
+PUMP_K = 30.0 * 1_073_000_000 / 1_000_000_000
+PUMP_START_SOL, PUMP_RAISE_SOL = 30.0, 85.0
+
+
+def curve_progress(market_cap_usd: float, sol_usd: float) -> float:
+    """0 to 1: how much of the 85 SOL a pump fun coin has raised, from its market cap."""
+    if market_cap_usd <= 0 or sol_usd <= 0:
+        return 0.0
+    virtual_sol = math.sqrt(market_cap_usd / sol_usd * PUMP_K)
+    return min(max((virtual_sol - PUMP_START_SOL) / PUMP_RAISE_SOL, 0.0), 1.0)
+
+
+def curve_liquidity(market_cap_usd: float, sol_usd: float) -> float:
+    """Both sides of the curve's (virtual) pool in dollars: what price impact is worked out
+    from, the same way as for a normal pool."""
+    if market_cap_usd <= 0 or sol_usd <= 0:
+        return 0.0
+    return 2.0 * math.sqrt(market_cap_usd * PUMP_K * sol_usd)
 
 
 @dataclass(frozen=True)
@@ -40,6 +65,20 @@ class Snapshot:
     boosts: int
     socials: int
     promo_known: bool = True  # False when the feed has no boost/social data (GeckoTerminal)
+    sol_usd: float = 0.0  # price of SOL when the coin is quoted in SOL (0 = unknown)
+
+    @property
+    def pre_migration(self) -> bool:
+        """Still on pump fun's starting curve: it has not moved to a normal pool yet."""
+        return self.dex == PUMP_CURVE
+
+    @property
+    def curve_done(self) -> float | None:
+        """How far along pump fun's curve the coin is, 0 to 1 (1 = it migrates). None when
+        it is not on the curve or SOL's price is unknown."""
+        if not self.pre_migration or self.sol_usd <= 0:
+            return None
+        return curve_progress(self.market_cap, self.sol_usd)
 
     @property
     def buy_ratio(self) -> float:
@@ -89,6 +128,15 @@ class Rules:
     # guard rails
     no_repeat_losers: bool = False  # never buy a coin again after closing it at a loss
     auto_pause_drawdown: float = 0.30  # stop buying once the account is this far below its start
+    # whale flow (hype/whales.py); whale_min_usd = 0 means the rule set ignores it
+    whale_min_usd: float = 0.0  # above 0: use whale flow; the least a "big" trade can be (see big_size)
+    whale_window_min: float = 10.0  # look at the last 10 minutes
+    whale_min_buyers: int = 3  # at least 3 different whales buying...
+    whale_ratio: float = 2.0  # ...and twice as many dollars bought as sold (and the reverse to exit)
+    whale_checks: int = 3  # coins per scan whose whale flow is looked up (the data is rate-limited)
+    stake_pct: float = 0.0  # above 0: bet this share of the account instead of the fixed stake
+    stage: str = ""  # "pre": only coins still on pump fun's curve (found through feed.early())
+    min_curve: float = 0.0  # with stage "pre": how far along the curve a coin must be (0 to 1)
 
 
 @dataclass(frozen=True)
@@ -108,6 +156,24 @@ VARIANTS: tuple[Variant, ...] = (
             Rules(no_repeat_losers=True, cooldown_hours=24.0)),
     Variant("deep_pools", "Bigger pools only", "Skips anything under $100k in the pool",
             Rules(min_liquidity=100_000.0, min_mcap=500_000.0, min_txns_5m=80)),
+    # Buy what the big wallets are buying, instead of what has already jumped: the price only
+    # has to be holding up (not falling), and three whales must have bought in the last ten
+    # minutes with little whale selling against them. Sells when the whales turn.
+    Variant("whales", "Follow the whales", "Buys only when big wallets are buying",
+            Rules(whale_min_usd=250.0, min_chg_5m=0.0, min_vol_accel=1.0, min_score=0.0,
+                  no_repeat_losers=True, cooldown_hours=24.0)),
+    # The same whale rule with the quick exit and account-sized bets from the "agent bot"
+    # videos: out at -8%, 7% of the account per coin.
+    # Before they migrate: coins still on pump fun's curve that are drawing a crowd. Found
+    # through DexScreener's fresh profiles and boosts; small, young, busy, more buying than selling.
+    Variant("early", "Before they migrate", "Buys buzzing pump fun coins before they migrate",
+            Rules(stage="pre", min_curve=0.15, min_liquidity=3_000.0, min_mcap=0.0, max_mcap=1e12,
+                  min_age_min=5.0, max_age_hours=3.0, min_txns_5m=60, min_buy_ratio=0.55,
+                  min_vol_accel=1.0, min_chg_5m=0.0, min_score=0.0, no_repeat_losers=True,
+                  cooldown_hours=24.0)),
+    Variant("whales_quick", "Whales, quick exit", "Whale buys, out at -8%, bets 7% of the account",
+            Rules(whale_min_usd=250.0, min_chg_5m=0.0, min_vol_accel=1.0, min_score=0.0,
+                  no_repeat_losers=True, cooldown_hours=24.0, stop_loss=-0.08, stake_pct=0.07)),
 )
 
 BANNED_MAX = 500  # how many lost-on coins an account remembers
@@ -131,6 +197,12 @@ def score(s: Snapshot) -> float:
 def entry_check(s: Snapshot, rules: Rules) -> list[str]:
     """Reasons NOT to buy (empty list = passes every rule)."""
     no = []
+    if rules.stage == "pre":
+        done = s.curve_done
+        if not s.pre_migration:
+            no.append("already migrated")
+        elif done is None or done < rules.min_curve:
+            no.append(f"barely started ({(done or 0):.0%} of the way to migrating)")
     if s.liquidity < rules.min_liquidity:
         no.append(f"thin pool (${s.liquidity:,.0f})")
     if not rules.min_mcap <= s.market_cap <= rules.max_mcap:
