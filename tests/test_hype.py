@@ -839,7 +839,8 @@ class PgHypeStoreTest(test_pg_store.PgTestCase):
         scout.save_doc("scout", {**doc, "updated": "now"})
         self.assertEqual(scout.load_doc("scout"), {**doc, "updated": "now"})
         self.assertIsNone(scout.load_hype())  # the document is not mistaken for the scout "account"
-        self.assertIsNone(PgHypeStore(self.store, "_scout").load_hype() and None)
+        with self.assertRaises(ValueError):  # and no account can be given a document's name
+            PgHypeStore(self.store, "_scout")
 
 
 class RateLimitedClientTest(unittest.TestCase):

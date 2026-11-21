@@ -39,6 +39,8 @@ CURRENT = "current"  # the original bot's account id
 
 class PgHypeStore:
     def __init__(self, pg: Any, account: str = CURRENT) -> None:
+        if account.startswith("_"):  # that prefix is for documents (load_doc/save_doc)
+            raise ValueError("an account id can't start with an underscore")
         self.pg = pg  # a PostgresStore
         self.account = account
         with pg._tx() as cur:
