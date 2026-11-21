@@ -79,29 +79,40 @@ def words(s: Snapshot) -> set[str]:
     return {w for w in found if w not in _BORING}
 
 
-def themes(coins: Iterable[Snapshot]) -> dict[str, list[Snapshot]]:
-    """word -> the young coins that carry it, for words shared by enough different coins."""
+def subjects(coins: Iterable[Snapshot]) -> list[tuple[str, list[Snapshot], set[str]]]:
+    """Trending subjects among young coins: (word, the coins that carry it, every other word
+    that points at mostly the same coins), biggest subject first.
+
+    Copies of one coin share every word of its name, and a copy with one extra word makes a
+    slightly different group, so groups that mostly overlap are one subject. The biggest group
+    wins; between equals, the word most of the coins use as their symbol, then the longest.
+    The other words are returned so the caller can treat them as already reported."""
     by_word: dict[str, dict[str, Snapshot]] = {}
     for s in coins:
         if s.age_min is None or s.age_min > THEME_AGE_HOURS * 60:
             continue
         for w in words(s):
             by_word.setdefault(w, {})[s.token] = s
-    # Copies of one coin share every word of its name: keep one word per group of coins (the
-    # one most of them use as their symbol, then the longest), so "last penny" is one subject.
-    best: dict[frozenset, str] = {}
-    for w, c in by_word.items():
-        if len(c) < THEME_COINS:
-            continue
-        group = frozenset(c)
 
-        def rank(word: str, coins: dict = c) -> tuple:
-            return (sum(word == s.symbol.lower() for s in coins.values()), len(word), word)
+    def rank(word: str) -> tuple:
+        group = by_word[word]
+        return (len(group), sum(word == s.symbol.lower() for s in group.values()), len(word), word)
 
-        if group not in best or rank(w) > rank(best[group]):
-            best[group] = w
-    return {w: sorted(by_word[w].values(), key=lambda x: -(x.buys_5m + x.sells_5m))
-            for w in best.values()}
+    kept: list[tuple[str, set[str], set[str]]] = []  # (word, its coins, absorbed words)
+    for w in sorted((w for w, c in by_word.items() if len(c) >= THEME_COINS), key=rank, reverse=True):
+        mine = set(by_word[w])
+        home = next((k for k in kept if len(mine & k[1]) * 2 >= len(mine)), None)
+        if home is None:
+            kept.append((w, mine, set()))
+        else:
+            home[2].add(w)  # at least half of its coins are already in a bigger subject
+    return [(w, sorted(by_word[w].values(), key=lambda x: -(x.buys_5m + x.sells_5m)), also)
+            for w, _, also in kept]
+
+
+def themes(coins: Iterable[Snapshot]) -> dict[str, list[Snapshot]]:
+    """word -> the young coins that carry it, one entry per subject (see `subjects`)."""
+    return {w: group for w, group, _ in subjects(coins)}
 
 
 def is_early(s: Snapshot) -> bool:
@@ -188,14 +199,21 @@ class Scout:
                         f"in 5 min, ${s.liquidity:,.0f} pool")
                 if self._raise(doc, now, "migrated", s, text):
                     raised.append(s)
-        for word, group in themes(coins.values()).items():
+        for word, group, also in subjects(coins.values()):
             lead = group[0]
             counts: dict[str, int] = {}
             for g in group:
                 counts[g.symbol] = counts.get(g.symbol, 0) + 1
             names = ", ".join(sym + (f" ×{n}" if n > 1 else "") for sym, n in list(counts.items())[:6])
-            self._raise(doc, now, "theme", lead, f"{len(group)} new coins about '{word}': {names}",
-                        key=f"theme:{word}", title=word.upper(), bonus=5.0 * min(len(group), 4))
+            # one alert per subject: if any of its words was reported lately, so was the subject
+            known = [w for w in (word, *sorted(also)) if f"theme:{w}" in doc["seen"]]
+            if not known:
+                self._raise(doc, now, "theme", lead, f"{len(group)} new coins about '{word}': {names}",
+                            key=f"theme:{word}", title=word.upper(), bonus=5.0 * min(len(group), 4))
+            until = max([doc["seen"].get(f"theme:{w}", "") for w in (word, *also)] or [""])
+            for w in (word, *also):  # every word of the subject counts as reported
+                if until:
+                    doc["seen"][f"theme:{w}"] = until
         # whale flow for the busiest few: this minute's alerts first, then the busiest others
         rest = sorted((s for s in coins.values() if s not in raised and s.pair),
                       key=lambda s: -(s.buys_5m + s.sells_5m))

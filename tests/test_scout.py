@@ -13,7 +13,7 @@ from tradinglab.hype.feeds import SAFETY_PER_MINUTE, SAFETY_TTL, TRADES_TTL, Sha
 from tradinglab.hype.geckoterminal import GeckoTerminalClient
 from tradinglab.hype.model import VARIANTS, Rules, curve_liquidity, curve_progress
 from tradinglab.hype.rugcheck import RugCheckClient, Verdict, judge
-from tradinglab.hype.scout import Scout, is_early, is_migrated, links, summary, themes
+from tradinglab.hype.scout import Scout, is_early, is_migrated, links, subjects, summary, themes
 from tradinglab.hype.whales import big_size, flow
 
 MINT = "MintAAA111pump"
@@ -254,6 +254,20 @@ class ScoutTests(unittest.TestCase):
         self.clock.t += timedelta(hours=7)
         self.assertEqual(len(self.scout.step()["alerts"]), 4)  # six hours on, it may be
 
+    def test_one_subject_is_reported_once_whichever_of_its_words_leads_later(self):
+        def coin(i, name):
+            return replace(hot(addr=f"Em{i}", age_min=30), name=name, symbol="Emily")
+
+        coins = [coin(0, "Emily Supercat"), coin(1, "Emily Supercat"), coin(2, "Emily Supercat"), coin(3, "Emily")]
+        self.m.trending, self.m.data = [c.token for c in coins], {c.token: c for c in coins}
+        doc = self.scout.step()
+        self.assertEqual([a["title"] for a in doc["alerts"] if a["kind"] == "theme"], ["EMILY"])
+        # the plain "Emily" drops off the list: now "supercat" covers exactly the same coins
+        self.m.trending = self.m.trending[:3]
+        self.clock.t += timedelta(minutes=1)
+        doc = self.scout.step()
+        self.assertEqual([a["title"] for a in doc["alerts"] if a["kind"] == "theme"], ["EMILY"])
+
     def test_a_shared_subject_is_one_theme_alert(self):
         coins = [hot(addr=a, age_min=60) for a in ("GtaSix111", "GtaVice222", "GtaCity333")]
         coins = [replace(c, name=n, symbol=s) for c, n, s in zip(
@@ -262,6 +276,15 @@ class ScoutTests(unittest.TestCase):
         self.assertEqual(themes(coins[:2]), {})  # two coins is not a trend
         copies = [replace(hot(addr=f"Copy{i}", age_min=30), name="Last Penny", symbol="PENNY") for i in range(3)]
         self.assertEqual(list(themes(copies)), ["penny"])  # one subject, not one per word
+        # a copy with an extra word, and one with a different second word: still one subject
+        emily = [replace(hot(addr=f"Em{i}", age_min=30), name=n, symbol="Emily") for i, n in enumerate(
+            ("Emily Supercat", "Emily Supercat", "Emily Supercat", "Emily"))]
+        self.assertEqual(list(themes(emily)), ["emily"])
+        word, group, also = subjects(emily)[0]
+        self.assertEqual((word, len(group), also), ("emily", 4, {"supercat"}))
+        # two subjects that share nothing are still two
+        both = emily + [replace(hot(addr=f"Gm{i}", age_min=30), name="Gamestop", symbol="GME") for i in range(3)]
+        self.assertEqual(sorted(themes(both)), ["emily", "gme"])  # the word they use as their symbol
         self.m.trending, self.m.data = [c.token for c in coins], {c.token: c for c in coins}
         doc = self.scout.step()
         self.assertEqual([a["title"] for a in doc["alerts"] if a["kind"] == "theme"], ["GTA"])
