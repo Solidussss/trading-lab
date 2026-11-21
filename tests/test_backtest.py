@@ -100,7 +100,7 @@ class FillModelTests(unittest.TestCase):
         self.assertLessEqual(first.exposure, 0.30 + 1e-9)
 
     def test_costs_applied_on_both_sides(self):
-        d0, d1, d5, d6 = DAYS[0], DAYS[1], DAYS[5], DAYS[6]
+        d0, d5 = DAYS[0], DAYS[5]
         costs = CostModel(half_spread_bps=2, slippage_bps=3, stop_extra_bps=5,
                           sec_fee_rate=0.0, finra_taf_per_share=0.0)
         strat = Scripted({d0: Signal(Action.ENTER_LONG, "go", stop_price=95.0),

@@ -3,6 +3,9 @@ what's being hyped on Solana right now, and buys the strongest setups with prete
 
 It never holds a wallet, a key or an account anywhere: positions are rows in our database,
 filled against DexScreener prices with the pessimistic cost model in model.py.
+
+Several rule sets ("variants", see model.VARIANTS) run side by side, one HypeBot each, on
+separate pretend bankrolls. HypeRunner steps them all every cycle.
 """
 
 from __future__ import annotations
@@ -10,17 +13,19 @@ from __future__ import annotations
 import json
 import logging
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from tradinglab.hype.model import (
+    BANNED_MAX,
     Account,
     Position,
     Rules,
     Snapshot,
     Trade,
+    Variant,
     buy_fill,
     entry_check,
     exit_check,
@@ -30,15 +35,17 @@ from tradinglab.hype.model import (
 
 log = logging.getLogger(__name__)
 
-CYCLE_SECONDS = 30
-CURVE_EVERY_MIN = 5  # one portfolio-value point per 5 minutes...
+# The counts below are in cycles and are sized for a 10-second cycle: change them together.
+CYCLE_SECONDS = 10
+CURVE_EVERY_MIN = 5  # one portfolio-value point per 5 minutes of wall clock...
 CURVE_POINTS = 2016  # ...kept for 7 days
-TRAIL_POINTS = 60  # last 60 prices per open coin (~30 min)
-SCAN_EVERY = 2  # look for new coins every 2nd cycle (~1 min); open positions every cycle
+TRAIL_POINTS = 180  # last 180 prices per open coin (~30 min)
+SCAN_EVERY = 6  # look for new coins every 6th cycle (~1 min); open positions every cycle
+SUMMARY_EVERY = 60  # log what the scan saw every 60th cycle (~10 min); a multiple of SCAN_EVERY
 WATCH_SIZE = 12
 
 
-MISSING_LIMIT = 3  # checks in a row with no data before a pool counts as pulled
+MISSING_LIMIT = 9  # checks in a row (~90 s) with no data before a pool counts as pulled
 
 
 class Source(Protocol):
@@ -107,9 +114,16 @@ def _iso(t: datetime) -> str:
 
 
 class HypeBot:
+    """One account trading one rule set. `buys_enabled=False` pauses new buys (open positions
+    still exit by the rules); `name` is the variant id and starts every log line."""
+
     def __init__(self, source: Source, store: HypeStore, rules: Rules | None = None,
-                 clock: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+                 buys_enabled: bool = True, name: str = "") -> None:
         self.source, self.store, self.rules, self.clock = source, store, rules or Rules(), clock
+        self.buys_enabled, self.name = buys_enabled, name
+        self.tag = f"hype[{name}]" if name else "hype"
+        self._quiet = 0  # cycles since the last write in which nothing changed
 
     def account(self) -> Account:
         acct = self.store.load_hype()
@@ -118,22 +132,43 @@ class HypeBot:
     def step(self) -> Account:
         now = self.clock()
         acct = self.account()
-        acct.cycles += 1
+        acct.cycles += 1 + self._quiet  # quiet cycles were counted here, not written
+        before = (bool(acct.positions), acct.paused, acct.last_error)
         closed: list[Trade] = []
+        scanned = False
         try:
             self._manage(acct, now, closed)
             if acct.cycles % SCAN_EVERY == 1 or not acct.watch:
+                scanned = True
                 self._scan(acct, now)
             acct.last_error = ""
         except Exception as exc:  # noqa: BLE001 - keep the books consistent; retry next cycle
-            log.warning("hype cycle failed: %s", exc)
+            log.warning("%s cycle failed: %s", self.tag, exc)
             acct.last_error = f"{type(exc).__name__}: {exc}"[:300]
         acct.last_cycle = _iso(now)
+        self._auto_pause(acct)
         last = datetime.fromisoformat(acct.curve[-1][0]) if acct.curve else None
-        if last is None or now - last >= timedelta(minutes=CURVE_EVERY_MIN):
+        point = last is None or now - last >= timedelta(minutes=CURVE_EVERY_MIN)
+        if point:
             acct.curve = (acct.curve + [[_iso(now), round(equity(acct, self.rules), 2)]])[-CURVE_POINTS:]
+        # With nothing held, nothing sold, no scan and no new chart point, the account is the
+        # same as the stored one: skip the write (the whole account is one JSON document, and
+        # three accounts every 10 seconds would rewrite it thousands of times a day for nothing).
+        if not (closed or scanned or point or acct.positions
+                or before != (False, acct.paused, acct.last_error)):
+            self._quiet += 1
+            return acct
+        self._quiet = 0
         self.store.save_hype(acct, closed)
         return acct
+
+    def _auto_pause(self, acct: Account) -> None:
+        """Stop buying once the account is too far below its starting bankroll. It stays
+        paused until someone clears `paused` on the stored account."""
+        floor = self.rules.bankroll * (1 - self.rules.auto_pause_drawdown)
+        if not acct.paused and equity(acct, self.rules) < floor:
+            acct.paused = f"down {self.rules.auto_pause_drawdown:.0%} from its start"
+            log.warning("%s: paused for new buys, %s", self.tag, acct.paused)
 
     # -- open positions -------------------------------------------------------------------
 
@@ -162,7 +197,8 @@ class HypeBot:
                     p.realized += got
                     acct.cash += got
                     p.half_taken = True
-                    log.info("hype: took half of %s at %+.0f%% (+$%.2f)", p.symbol, p.gain() * 100, got)
+                    log.info("%s: took half of %s at %+.0f%% (+$%.2f)", self.tag, p.symbol,
+                             p.gain() * 100, got)
             reason = exit_check(p, s, now, self.rules)
             if reason is None:
                 keep.append(p)
@@ -174,10 +210,12 @@ class HypeBot:
                 got = sell_fill(s.price, p.qty, s.liquidity, self.rules)  # type: ignore[union-attr]
             acct.cash += got
             acct.cooldown[p.token] = _iso(now + timedelta(hours=self.rules.cooldown_hours))
-            closed.append(Trade(p.token, p.symbol, p.url, p.opened, _iso(now), p.stake,
-                                round(p.realized + got, 4), reason, p.why,
-                                round(p.peak / p.entry_price - 1, 4)))
-            log.info("hype: sold %s (%s) P&L $%.2f", p.symbol, reason, p.realized + got - p.stake)
+            trade = Trade(p.token, p.symbol, p.url, p.opened, _iso(now), p.stake,
+                          round(p.realized + got, 4), reason, p.why, round(p.peak / p.entry_price - 1, 4))
+            closed.append(trade)
+            if self.rules.no_repeat_losers and trade.pnl <= 0:  # lost on it once: never again
+                acct.banned = ([t for t in acct.banned if t != p.token] + [p.token])[-BANNED_MAX:]
+            log.info("%s: sold %s (%s) P&L $%.2f", self.tag, p.symbol, reason, trade.pnl)
         acct.positions = keep
 
     # -- scanning and buying --------------------------------------------------------------
@@ -186,9 +224,13 @@ class HypeBot:
         acct.cooldown = {t: u for t, u in acct.cooldown.items() if datetime.fromisoformat(u) > now}
         held = {p.token for p in acct.positions}
         ranked = sorted((s for s in self.source.discover() if s.token not in held), key=score, reverse=True)
+        paused = not self.buys_enabled or bool(acct.paused)
+        banned = set(acct.banned) if self.rules.no_repeat_losers else set()
         watch, bought = [], 0
         for s in ranked:
-            no = entry_check(s, self.rules)
+            # reasons about this account come first so the page shows them, then the coin's own
+            no = (["paused"] if paused else []) + (["lost on it before"] if s.token in banned else [])
+            no += entry_check(s, self.rules)
             if s.token in acct.cooldown:
                 no.append("traded recently (cooldown)")
             can_buy = (not no and len(acct.positions) < self.rules.max_open
@@ -204,15 +246,15 @@ class HypeBot:
                               "buy_ratio": round(s.buy_ratio, 3), "vol_accel": round(s.vol_accel, 2),
                               "bought": can_buy, "why_not": no[:3]})
         acct.watch = watch
-        if acct.cycles % 20 == 1:  # every ~10 min: what it saw and why it passed
+        if acct.cycles % SUMMARY_EVERY == 1:  # every ~10 min: what it saw and why it passed
             reasons: dict[str, int] = {}
             for s in ranked:
                 for r in entry_check(s, self.rules):
                     key = r.split(" (")[0]
                     reasons[key] = reasons.get(key, 0) + 1
             top = ", ".join(f"{k} x{n}" for k, n in sorted(reasons.items(), key=lambda kv: -kv[1])[:5])
-            log.info("hype scan: %d coins, %d bought, best score %.0f; skipped for: %s", len(ranked),
-                     bought, score(ranked[0]) if ranked else 0, top or "-")
+            log.info("%s scan: %d coins, %d bought, best score %.0f; skipped for: %s", self.tag,
+                     len(ranked), bought, score(ranked[0]) if ranked else 0, top or "-")
 
     def _buy(self, acct: Account, s: Snapshot, now: datetime) -> None:
         stake = self.rules.stake
@@ -225,7 +267,7 @@ class HypeBot:
             entry_price=eff, seen_price=s.price, entry_liquidity=s.liquidity, entry_score=score(s),
             why=why, peak=s.price, last=s.price, last_liquidity=s.liquidity, pair=s.pair,
             trail=[s.price]))
-        log.info("hype: bought %s for $%.0f (%s)", s.symbol, stake, why)
+        log.info("%s: bought %s for $%.0f (%s)", self.tag, s.symbol, stake, why)
 
 
 def equity(acct: Account, rules: Rules) -> float:
@@ -234,30 +276,61 @@ def equity(acct: Account, rules: Rules) -> float:
 
 
 class HypeRunner(threading.Thread):
-    """Runs the bot every CYCLE_SECONDS, 24/7 (crypto never closes)."""
+    """Runs every variant's bot every CYCLE_SECONDS, 24/7 (crypto never closes).
 
-    def __init__(self, bot_factory: Callable[[], HypeBot], interval: float = CYCLE_SECONDS) -> None:
+    `bots_factory` builds one HypeBot per variant (called again after a failure, so it can
+    open a fresh database connection). For the dashboard: `variants` pairs each Variant with
+    a store to read its account through, `feed_status()` says how the shared data feed is
+    doing, and `store` / `rules` are the "current" variant's, for the single-bot page.
+    """
+
+    def __init__(self, bots_factory: Callable[[], Sequence[HypeBot]], interval: float = CYCLE_SECONDS, *,
+                 variants: Sequence[tuple[Variant, Any]] = (), feed: Any = None) -> None:
         super().__init__(name="hype-bot", daemon=True)
-        self._factory, self._interval = bot_factory, interval
-        self._stop = threading.Event()
-        self.bot: HypeBot | None = None
+        self._factory, self._interval = bots_factory, interval
+        self._halt = threading.Event()
+        self.bots: list[HypeBot] = []
+        self.variants: list[tuple[Variant, Any]] = list(variants)
+        self.feed = feed
+        current = next((pair for pair in self.variants if pair[0].id == "current"),
+                       self.variants[0] if self.variants else None)
+        self.store: Any = current[1] if current else None
+        self.rules: Rules = current[0].rules if current else Rules()
         self.error = ""
 
     def run(self) -> None:
-        while not self._stop.is_set():
+        while not self._halt.is_set():
+            self.run_once()
+            self._halt.wait(self._interval)
+
+    def run_once(self) -> None:
+        """One cycle of every variant. Never raises: one failing variant must not stop the others."""
+        try:
+            if not self.bots:
+                self.bots = list(self._factory())
+        except Exception as exc:  # noqa: BLE001 - never let the thread die
+            log.exception("hype runner could not build its bots")
+            self.error = f"{type(exc).__name__}: {exc}"[:300]
+            return
+        errors = []
+        for bot in self.bots:
             try:
-                if self.bot is None:
-                    self.bot = self._factory()
-                self.bot.step()
-                self.error = ""
-            except Exception as exc:  # noqa: BLE001 - never let the thread die
-                log.exception("hype runner error")
-                self.error = f"{type(exc).__name__}: {exc}"[:300]
-                self.bot = None  # rebuild (e.g. fresh DB connection) next time
-            self._stop.wait(self._interval)
+                bot.step()
+            except Exception as exc:  # noqa: BLE001 - report it and carry on with the next variant
+                log.exception("%s runner error", bot.tag)
+                errors.append(f"{bot.name}: {type(exc).__name__}: {exc}")
+        self.error = "; ".join(errors)[:300]
+        if errors:
+            self.bots = []  # rebuild (e.g. fresh DB connection) next time
+
+    def feed_status(self) -> dict[str, Any]:
+        """The shared feed's health: rate_limited_1h, last_ok and last_error."""
+        if self.feed is None:
+            return {"rate_limited_1h": 0, "last_ok": "", "last_error": ""}
+        return self.feed.status()
 
     def stop(self) -> None:
-        self._stop.set()
+        self._halt.set()
 
 
 def trade_to_row(t: Trade) -> dict[str, Any]:

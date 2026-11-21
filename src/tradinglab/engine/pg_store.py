@@ -21,13 +21,14 @@ from collections.abc import Callable, Iterator, Mapping
 from datetime import UTC, date, datetime
 from typing import Any
 
-from tradinglab.engine.pg_intraday import INTRADAY_MIGRATION, IntradayPgMixin
+from tradinglab.engine.pg_intraday import INTRADAY_MIGRATION, PICKS_MIGRATION, IntradayPgMixin
 from tradinglab.engine.store import EngineBusyError, EngineEvent
 from tradinglab.marketdata.bars import Bar
 from tradinglab.sim.core import Decision, EquityPoint, Fill, PortfolioState, StepResult, Trade
 
 ADVISORY_LOCK_KEY = 7_401_552_093  # arbitrary, fixed: "trading-lab engine run"
-LOCK_KEYS = {"engine": ADVISORY_LOCK_KEY, "intraday": ADVISORY_LOCK_KEY + 1}
+LOCK_KEYS = {"engine": ADVISORY_LOCK_KEY, "intraday": ADVISORY_LOCK_KEY + 1,
+             "inplay": ADVISORY_LOCK_KEY + 2}
 
 MIGRATIONS: list[str] = [
     # 1: initial schema
@@ -125,6 +126,8 @@ MIGRATIONS: list[str] = [
     """,
     # 3: day-trading bots (shared 5-minute prices, one account per bot, history tests)
     INTRADAY_MIGRATION,
+    # 4: the stocks-in-play bots' morning picks
+    PICKS_MIGRATION,
 ]
 
 
@@ -297,7 +300,7 @@ class PostgresStore(IntradayPgMixin):
         return self.recent_decisions(None)
 
     def recent_decisions(self, n: int | None = 100) -> list[Decision]:
-        sql = f"SELECT {self._DEC_COLS} FROM decisions ORDER BY id DESC"
+        sql = f"SELECT {self._DEC_COLS} FROM decisions ORDER BY id DESC"  # noqa: S608 - fixed column list
         rows = self._query(sql + (" LIMIT %s" if n else ""), (n,) if n else ())
         out = []
         for r in reversed(rows):

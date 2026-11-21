@@ -152,6 +152,17 @@ class TiingoClient:
             raise DataProviderError(f"{symbol}: expected a list of intraday rows")
         return rows
 
+    def iex_quotes(self, tickers: Sequence[str]) -> list[dict[str, Any]]:
+        """Latest quote rows (ticker, tngoLast, prevClose, open, timestamp, ...) for many
+        tickers in ONE request. Tiingo documents /iex for every ticker and /iex/<ticker> for
+        one; the `tickers` filter keeps the reply small where it is honoured, and callers
+        filter by ticker anyway, so an unfiltered reply still works."""
+        query = urllib.parse.urlencode({"tickers": ",".join(t.lower() for t in tickers)})
+        rows = self._get_json(f"{DATA_PROVIDER_URL}/iex/?{query}")
+        if not isinstance(rows, list):
+            raise DataProviderError("expected a list of quotes")
+        return [r for r in rows if isinstance(r, dict)]
+
     def history(self, symbols: Sequence[str], start: date, end: date
                 ) -> tuple[dict[str, BarSeries], dict[str, DatasetMeta]]:
         out, metas = {}, {}

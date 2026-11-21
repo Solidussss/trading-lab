@@ -28,7 +28,7 @@ from tradinglab.config import Settings
 from tradinglab.engine.risk import RiskParams
 from tradinglab.engine.store import EngineBusyError, EngineEvent
 from tradinglab.intraday.core import INTRADAY_COSTS, BotState, DayResult, IntradayCore
-from tradinglab.intraday.strategies import REGISTRY, IntradayStrategy
+from tradinglab.intraday.strategies import ALL_STRATEGIES, REGISTRY, IntradayStrategy
 from tradinglab.marketdata.calendar import (
     is_trading_day,
     next_trading_day,
@@ -59,9 +59,25 @@ class BotSpec:
     id: str
     strategy_id: str
     params: dict = field(default_factory=dict)
+    universe: str = "etf"  # "etf": the three funds; "in_play": the morning scan's picks
+    name: str = ""  # shown instead of the strategy's own name, summary and rules when set
+    summary: str = ""
+    rules: tuple[str, ...] = ()
 
     def strategy(self) -> IntradayStrategy:
-        return REGISTRY[self.strategy_id](**self.params)
+        return ALL_STRATEGIES[self.strategy_id](**self.params)
+
+    @property
+    def title(self) -> str:
+        return self.name or ALL_STRATEGIES[self.strategy_id].name
+
+    @property
+    def blurb(self) -> str:
+        return self.summary or ALL_STRATEGIES[self.strategy_id].summary
+
+    @property
+    def rule_lines(self) -> tuple[str, ...]:
+        return self.rules or tuple(ALL_STRATEGIES[self.strategy_id].rules)
 
 
 DEFAULT_BOTS: tuple[BotSpec, ...] = tuple(BotSpec(sid, sid) for sid in REGISTRY)
@@ -97,6 +113,8 @@ RowFetcher = Callable[[str, date, date], list]
 
 
 class IntradayRunner:
+    lock_name = "intraday"  # one run at a time per runner; owner actions take the same lock
+
     def __init__(self, settings: Settings, store, fetch_rows: RowFetcher,
                  bots: Sequence[BotSpec] = DEFAULT_BOTS) -> None:
         self.settings = settings
@@ -109,8 +127,14 @@ class IntradayRunner:
 
     # -- wiring ---------------------------------------------------------------------------
 
-    def core(self, bot: BotSpec) -> IntradayCore:
-        return IntradayCore(bot.strategy(), self.symbols, self.risk, INTRADAY_COSTS)
+    def symbols_on(self, day: date) -> list[str]:
+        """What the bots trade on `day`. Always the same funds here; the stocks-in-play runner
+        answers with that morning's picks."""
+        return list(self.symbols)
+
+    def core(self, bot: BotSpec, symbols: Sequence[str] | None = None) -> IntradayCore:
+        return IntradayCore(bot.strategy(), self.symbols if symbols is None else symbols,
+                            self.risk, INTRADAY_COSTS)
 
     def fingerprint(self, bot: BotSpec) -> str:
         blob = {"strategy": bot.strategy().label, "symbols": self.symbols,
@@ -126,17 +150,18 @@ class IntradayRunner:
             return None
         return self.store.get_flag("iex_end_labelled")
 
-    def bars_for(self, day: date, now: datetime, report: IntradayReport, *,
-                 refresh: bool) -> tuple[dict[str, list[IBar]], bool]:
+    def bars_for(self, day: date, now: datetime, report: IntradayReport, *, refresh: bool,
+                 symbols: Sequence[str] | None = None, live_refresh: timedelta = LIVE_REFRESH
+                 ) -> tuple[dict[str, list[IBar]], bool]:
         """Completed bars for `day` (fetched when missing or stale), and whether every symbol's
         data for the day is final. Only bars that have fully closed by `now` are used."""
         after_close = settled(day, now)
         all_final = True
         out = {}
-        for sym in self.symbols:
+        for sym in (self.symbols if symbols is None else symbols):
             info = self.store.fetches(sym, day, day).get(day)
             stale = info is None or (not info.final and (
-                after_close or now - info.fetched_at >= LIVE_REFRESH))
+                after_close or now - info.fetched_at >= live_refresh))
             if refresh and stale:
                 rows = self.fetch_rows(sym, day, day)
                 report.requests += 1
@@ -162,17 +187,19 @@ class IntradayRunner:
             out[sym] = [b for b in self.store.ibars(sym, day) if b.end <= now]
         return out, all_final
 
-    def prev_closes(self, day: date) -> dict[str, float | None]:
+    def prev_closes(self, day: date, symbols: Sequence[str] | None = None
+                    ) -> dict[str, float | None]:
         """Yesterday's closing price: the last 5-minute price of the previous session (the same
         source live, in "today so far" and in history tests); the official close if missing."""
         prev = previous_trading_day(day)
         out: dict[str, float | None] = {}
-        for sym in self.symbols:
+        for sym in (self.symbols if symbols is None else symbols):
             bars = self.store.ibars(sym, prev)
             out[sym] = bars[-1].close if bars else self.store.official_close(sym, prev)
         return out
 
-    def history(self, bot: BotSpec, day: date) -> dict[str, list[list[IBar]]] | None:
+    def history(self, bot: BotSpec, day: date, symbols: Sequence[str] | None = None
+                ) -> dict[str, list[list[IBar]]] | None:
         """The sessions before `day` a strategy asks for (history_days), oldest first. Same
         rule as the history test: only sessions that have bars."""
         n = bot.strategy().history_days
@@ -182,7 +209,7 @@ class IntradayRunner:
         for _ in range(n + 5):  # a few spare sessions in case some have no data
             start = previous_trading_day(start)
         out = {}
-        for sym in self.symbols:
+        for sym in (self.symbols if symbols is None else symbols):
             by_day = split_by_day(self.store.ibars(sym, start, previous_trading_day(day)))
             out[sym] = [by_day[d] for d in sorted(by_day) if d < day and by_day[d]][-n:]
         return out
@@ -195,7 +222,7 @@ class IntradayRunner:
     def run(self, now: datetime | None = None) -> IntradayReport:
         now = now or datetime.now(UTC)
         try:
-            with self.store.run_lock("intraday"):
+            with self.store.run_lock(self.lock_name):
                 return self._run(now)
         except EngineBusyError as exc:
             return IntradayReport("busy", messages=[str(exc)])
@@ -274,7 +301,7 @@ class IntradayRunner:
     def resume_bot(self, bot_id: str, now: datetime | None = None) -> None:
         """After a 10% drop the bot waits for you: this resets its peak and lets it buy again."""
         now = now or datetime.now(UTC)
-        with self.store.run_lock("intraday"):
+        with self.store.run_lock(self.lock_name):
             st = self.store.load_bot(bot_id)
             if st is None or not st.halt_latched:
                 return
@@ -297,10 +324,12 @@ class IntradayRunner:
                      else st.start_day == day)
         if not caught_up:  # an earlier day isn't committed yet: don't show a stale balance
             return None
-        bars = {s: [b for b in self.store.ibars(s, day) if b.end <= now] for s in self.symbols}
-        return self.core(bot).run_day(copy.deepcopy(st), day, bars, self.prev_closes(day),
-                                      final=now >= session(day).close_utc, paused=self.pause_fn(),
-                                      history=self.history(bot, day))
+        syms = self.symbols_on(day)
+        bars = {s: [b for b in self.store.ibars(s, day) if b.end <= now] for s in syms}
+        return self.core(bot, syms).run_day(
+            copy.deepcopy(st), day, bars, self.prev_closes(day, syms),
+            final=now >= session(day).close_utc, paused=self.pause_fn(),
+            history=self.history(bot, day, syms))
 
     def _event(self, now: datetime, day: date | None, kind: str, detail: str) -> None:
         self.store.add_event(EngineEvent(now, day, kind, detail))

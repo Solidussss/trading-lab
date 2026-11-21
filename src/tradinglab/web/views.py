@@ -10,12 +10,13 @@ from __future__ import annotations
 import html
 from collections import defaultdict
 from collections.abc import Sequence
-from datetime import UTC, date, datetime
+from datetime import date, datetime
 from typing import Any
 
 from tradinglab.marketdata.bars import Bar
 from tradinglab.marketdata.calendar import next_trading_day
 from tradinglab.strategies.trend_following import DEFAULT_PARAMS
+from tradinglab.web import theme
 
 esc = html.escape
 FAST = int(DEFAULT_PARAMS["fast"])
@@ -505,121 +506,6 @@ def system_section(state: Any) -> str:
 <details><summary>Technical details</summary><ul class='tech'>{rows}</ul></details></footer>"""
 
 
-CSS = """
-:root{--bg:#EDF0EC;--surface:#FBFCFA;--ink:#1B2A33;--quiet:#5D6C74;--line:#D6DCD6;
---amber:#B7791F;--teal:#2B7A84;--gain:#1D7F52;--loss:#BD3B2A;--buy:#2B5EA8;--warn:#9A6A12;
---display:'Bricolage Grotesque',system-ui,sans-serif;--body:'Public Sans',system-ui,sans-serif}
-@media (prefers-color-scheme:dark){:root{--bg:#161C20;--surface:#1E262B;--ink:#E7ECEA;
---quiet:#9AA8AE;--line:#2F393F;--amber:#E0A447;--teal:#5DB7C2;--gain:#5CC48C;--loss:#F08A78;
---buy:#86ACEB;--warn:#E3B358}}
-*{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.55 var(--body)}
-main{max-width:680px;margin:0 auto;padding:28px 18px 56px}
-.brand{font:600 15px/1 var(--display);letter-spacing:.01em;margin:0 0 26px;color:var(--quiet)}
-.brand a{color:var(--ink);text-decoration:none;border-bottom:1.5px solid var(--line)}
-a{color:inherit}
-h1{font:650 clamp(30px,8vw,44px)/1.08 var(--display);letter-spacing:-.02em;margin:0 0 12px;
-font-variation-settings:'opsz' 96}
-.lede{font-size:18px;margin:0 0 10px;max-width:36em}
-.status{color:var(--quiet);font-size:14px;margin:0}
-h2{font:650 22px/1.2 var(--display);letter-spacing:-.01em;margin:44px 0 14px}
-h3{font:700 24px/1 var(--display);margin:0}
-h4{font:650 16px/1.3 var(--display);margin:18px 0 4px}
-.notice{background:var(--surface);border-left:4px solid var(--warn);padding:12px 14px;margin:18px 0 0;
-border-radius:0 8px 8px 0}
-.quiet{color:var(--quiet)} .small{font-size:14px}
-.nw{white-space:nowrap}
-.gain{color:var(--gain)} .loss{color:var(--loss)} .flat{color:var(--quiet)}
-.value{font:650 clamp(40px,11vw,56px)/1 var(--display);letter-spacing:-.03em;margin:0;
-font-variant-numeric:tabular-nums}
-.since{margin:8px 0 16px}
-.split{display:flex;gap:28px;margin:0 0 14px}
-.split dt{color:var(--quiet);font-size:14px} .split dd{margin:0;font:600 19px/1.3 var(--display)}
-.compare{background:var(--surface);padding:12px 14px;border-radius:10px;margin:14px 0}
-.fund{background:var(--surface);border-radius:14px;padding:18px 16px 14px;margin:0 0 14px;
-border:1px solid var(--line)}
-.fund header{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
-.fund header p{margin:6px 0 0}
-.badge{font:600 14px/1.2 var(--body);white-space:nowrap;padding-top:4px;display:flex;align-items:center;gap:7px}
-.badge::before{content:'';width:9px;height:9px;border-radius:50%;background:currentColor}
-.badge.watch{color:var(--quiet)} .badge.hold{color:var(--gain)} .badge.buy{color:var(--buy)}
-.badge.sell{color:var(--loss)} .badge.warn{color:var(--warn)}
-.pxrow{display:flex;align-items:baseline;gap:10px;margin:14px 0 4px}
-.px{font:650 22px/1 var(--display);font-variant-numeric:tabular-nums}
-.chart{width:100%;height:auto;display:block;margin:6px 0 2px;overflow:visible}
-.chart polyline{fill:none;stroke-linejoin:round;stroke-linecap:round}
-.chart .price{stroke:var(--ink);stroke-width:1.6}
-.chart .slow{stroke:var(--amber);stroke-width:2}
-.chart .fast{stroke:var(--teal);stroke-width:1.6;stroke-dasharray:4 3}
-.chart .dot{fill:var(--ink)} .chart .tag{font:600 13px var(--body);fill:var(--ink)}
-.chart .axis{font:11px var(--body);fill:var(--quiet)}
-.chart .base{stroke:var(--quiet);stroke-width:1;stroke-dasharray:2 3}
-.legend{font-size:13px;color:var(--quiet);margin:4px 0 0;display:flex;flex-wrap:wrap;
-align-items:center;gap:4px 14px}
-.legend span{white-space:nowrap}
-.legend .k{display:inline-block;width:18px;height:0;border-top:2.5px solid;margin-right:6px;
-vertical-align:middle}
-.legend .k.price{border-color:var(--ink)} .legend .k.slow{border-color:var(--amber)}
-.legend .k.fast{border-color:var(--teal);border-top-style:dashed}
-.story{margin:12px 0 0;max-width:38em}
-.timeline{list-style:none;margin:0;padding:0;border-left:2px solid var(--line)}
-.timeline .day{position:relative;padding:0 0 18px 18px}
-.timeline .day::before{content:'';position:absolute;left:-6px;top:6px;width:10px;height:10px;
-border-radius:50%;background:var(--bg);border:2px solid var(--quiet)}
-.timeline time{font:650 15px/1.4 var(--display)}
-.timeline ul{margin:2px 0 0;padding:0;list-style:none}
-.timeline ul li{margin:2px 0}
-details{margin-top:8px;background:var(--surface);border:1px solid var(--line);border-radius:12px}
-summary{cursor:pointer;font:650 18px/1.3 var(--display);padding:16px;list-style:none;display:flex;
-justify-content:space-between;align-items:center;gap:12px}
-summary::-webkit-details-marker{display:none}
-summary::after{content:'Show';font:600 14px/1 var(--body);color:var(--teal);white-space:nowrap}
-details[open] summary::after{content:'Hide'}
-.how{padding:0 16px 14px}
-.how p,.how li{max-width:38em} .how ul{padding-left:20px}
-.btns{display:flex;gap:10px;flex-wrap:wrap}
-button{font:600 16px/1 var(--body);padding:13px 18px;border-radius:10px;min-height:46px;cursor:pointer;
-border:1.5px solid var(--ink);background:transparent;color:var(--ink)}
-button.primary{background:var(--ink);color:var(--bg)}
-button:hover{background:var(--ink);color:var(--bg)} button:active{transform:translateY(1px)}
-button:focus-visible,summary:focus-visible{outline:3px solid var(--teal);outline-offset:2px}
-footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);font-size:14px}
-footer p{margin:0 0 6px}
-footer .ok{color:var(--gain)}
-footer details{background:none;border:0}
-footer summary{font:600 14px/1.3 var(--body);color:var(--quiet);padding:6px 0;justify-content:flex-start}
-.board{list-style:none;margin:0;padding:0}
-.board li{margin:0 0 10px}
-.botrow{display:grid;grid-template-columns:28px 1fr auto;gap:4px 12px;padding:14px;background:var(--surface);
-border:1px solid var(--line);border-radius:14px;text-decoration:none;color:var(--ink)}
-.botrow:hover{border-color:var(--quiet)}
-.rank{font:650 20px/1.2 var(--display);color:var(--quiet)}
-.who{display:flex;flex-direction:column;gap:3px;min-width:0}
-.who b{font:650 18px/1.25 var(--display)}
-.status-line{color:var(--teal)}
-.nums{display:flex;flex-direction:column;align-items:flex-end;gap:3px;text-align:right}
-.val{font:650 18px/1.25 var(--display);font-variant-numeric:tabular-nums}
-@media (max-width:420px){.botrow{grid-template-columns:22px 1fr}.nums{grid-column:2;align-items:flex-start;
-flex-direction:row;flex-wrap:wrap;gap:4px 12px;text-align:left}}
-.scroll{overflow-x:auto}
-.acct{margin-top:28px}
-table.bt{border-collapse:collapse;width:100%;font-size:15px;font-variant-numeric:tabular-nums}
-table.bt th,table.bt td{text-align:left;padding:9px 10px 9px 0;border-bottom:1px solid var(--line);vertical-align:top}
-table.bt thead th{font:600 13px/1.3 var(--body);color:var(--quiet)}
-table.bt tbody th{font-weight:600}
-table.bt a{text-decoration:none;border-bottom:1.5px solid var(--line)}
-.daylist{list-style:none;margin:0;padding:0}
-.daylist li{display:grid;grid-template-columns:1fr auto auto;gap:12px;padding:8px 0;border-bottom:1px solid var(--line);
-align-items:baseline}
-.chart .buy{fill:var(--gain)} .chart .sell{fill:var(--loss)}
-.tech{padding:0 0 0 0;list-style:none;color:var(--quiet);font-size:13px;word-break:break-word}
-"""
-
-FONTS = ("https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500..700"
-         "&family=Public+Sans:wght@400;600;700&display=swap")
-
-
 def render_trend_page(state: Any) -> str:
     """The daily trend-following account (one of the bots)."""
     symbols = list(state.report.settings.symbols) if state.report else list(FUNDS)
@@ -644,21 +530,9 @@ TREND_NAME = "Slow trend follower"
 
 
 def _shell(state: Any, big: str, sub: str, status: str, body: str, *, back: str = "",
-           title: str = "Trading Lab", refresh: int = 0) -> str:
-    now = datetime.now(UTC).astimezone(state.tz)
-    brand = (f'<p class="brand"><a href="/">← All bots</a> <span class="quiet">/ {esc(back)}</span></p>'
-             if back else '<p class="brand">Trading Lab <span class="quiet">(pretend money only)</span></p>')
-    meta = f'<meta http-equiv="refresh" content="{refresh}">' if refresh else ""
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="color-scheme" content="light dark"><title>{esc(title)}</title>{meta}
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="{FONTS}"><style>{CSS}</style></head><body><main>
-{brand}
-<h1>{esc(big)}</h1><p class="lede">{esc(sub)}</p><p class="status">{esc(status)}</p>
-{notice(state)}
-{body}
-{system_section(state)}
-<p class="quiet small">Page loaded {esc(now.strftime('%b %-d, %-I:%M %p'))}.</p>
-</main></body></html>"""
-
+           title: str = "Trading Lab", refresh: int = 0, active: str = "stocks") -> str:
+    """A page that leads with one plain-English headline, in the shared look (web/theme.py)."""
+    head = (f'<section class="headline"><h1>{esc(big)}</h1><p class="lede">{esc(sub)}</p>'
+            f'<p class="status">{esc(status)}</p></section>')
+    return theme.shell(state, title, head + notice(state) + body + system_section(state),
+                       active=active, back=back, refresh=refresh)

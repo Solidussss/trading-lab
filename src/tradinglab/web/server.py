@@ -75,6 +75,7 @@ class AppState:
         self.engine_note = ""
         self.hype: Any = None  # HypeRunner for the memecoin paper bot (None when off)
         self.intraday: Any = None  # IntradayRunner, for the dashboard's "today so far"
+        self.inplay: Any = None  # InPlayRunner: the stocks-in-play bots
         self._failures: dict[str, deque[float]] = defaultdict(deque)
         self._lock = threading.Lock()
 
@@ -155,14 +156,19 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
             path = self.path.split("?", 1)[0]
             if path == "/healthz":
                 return self._send(HTTPStatus.OK, "ok\n")
-            if path != "/" and path != "/hype" and not path.startswith("/bot/"):
+            pages = {"/": "overview_page", "/stocks": "stocks_page", "/tests": "tests_page",
+                     "/controls": "controls_page"}
+            if path not in pages and path != "/hype" and not path.startswith("/bot/"):
                 return self._send(HTTPStatus.NOT_FOUND, "not found\n")
             if not self._authorised():
                 return None
             if path == "/hype":
                 from tradinglab.web.views_hype import hype_page
 
-                return self._send(HTTPStatus.OK, hype_page(state), "text/html; charset=utf-8")
+                query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
+                account = (query.get("a") or [""])[0][:40]
+                return self._send(HTTPStatus.OK, hype_page(state, account=account),
+                                  "text/html; charset=utf-8")
             if path.startswith("/bot/"):
                 from tradinglab.web.views_bots import bot_page
 
@@ -170,7 +176,12 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 if page is None:
                     return self._send(HTTPStatus.NOT_FOUND, "not found\n")
                 return self._send(HTTPStatus.OK, page, "text/html; charset=utf-8")
-            return self._send(HTTPStatus.OK, render_page(state), "text/html; charset=utf-8")
+            if path == "/":
+                return self._send(HTTPStatus.OK, render_page(state), "text/html; charset=utf-8")
+            from tradinglab.web import views_bots
+
+            return self._send(HTTPStatus.OK, getattr(views_bots, pages[path])(state),
+                              "text/html; charset=utf-8")
 
         def do_POST(self):  # noqa: N802
             if self.path.split("?", 1)[0] != "/control":
@@ -197,11 +208,10 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
                 state.controls.resume()
             elif action == "resume_drawdown":
                 state.controls.resume_after_drawdown()
-            elif action.startswith("resume_bot:") and state.intraday is not None \
-                    and action[11:] in {b.id for b in state.intraday.bots}:
-                state.intraday.resume_bot(action[11:])
+            elif action.startswith("resume_bot:") and action[11:] in _runners(state):
+                _runners(state)[action[11:]].resume_bot(action[11:])
             elif action.startswith("unlock_test:") and state.intraday is not None \
-                    and action[12:] in {b.id for b in state.intraday.bots}:
+                    and action[12:] in {b.id for b in state.intraday.bots}:  # three-fund bots only
                 state.store.set_flag(action, True)
                 state.store.add_event(_event("final_test_opened", action[12:]))
             else:
@@ -209,7 +219,8 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
             log.warning("control action %r by %s", action, self._client())
             self.send_response(HTTPStatus.SEE_OTHER)
             ref = urllib.parse.urlsplit(self.headers.get("Referer") or "")
-            back = ref.path if ref.netloc == host and ref.path.startswith("/bot/") else "/"
+            back = ref.path if ref.netloc == host and (
+                ref.path.startswith("/bot/") or ref.path == "/controls") else "/"
             self.send_header("Location", back)
             for k, v in SECURITY_HEADERS.items():
                 self.send_header(k, v)
@@ -224,9 +235,18 @@ def make_handler(state: AppState) -> type[BaseHTTPRequestHandler]:
 
 
 def render_page(state: AppState) -> str:
-    from tradinglab.web.views_bots import leaderboard_page
+    from tradinglab.web.views_bots import overview_page
 
-    return leaderboard_page(state)
+    return overview_page(state)
+
+
+def _runners(state: AppState) -> dict[str, Any]:
+    """Bot id -> the runner that owns it (three-fund bots and stocks-in-play bots)."""
+    out: dict[str, Any] = {}
+    for runner in (state.intraday, getattr(state, "inplay", None)):
+        if runner is not None:
+            out.update({b.id: runner for b in runner.bots})
+    return out
 
 
 def _event(kind: str, detail: str):
@@ -263,16 +283,20 @@ def build_state(env: Mapping[str, str]) -> AppState:
         state.store = None
         state.engine_note = f"Database unavailable at startup: {type(exc).__name__}: {exc}"
         return state
-    from tradinglab.engine.runtime import ResearchJob, build_intraday
+    from tradinglab.engine.runtime import ResearchJob, build_inplay, build_intraday
 
     state.intraday = build_intraday(settings, state.store)
+    state.inplay = build_inplay(settings, state.store)
     start_hype(state, settings, env)
 
     def extra_jobs():
         store = postgres_store(settings)
         runner = build_intraday(settings, store)
         research = ResearchJob(runner, TiingoClient(settings.require_data_token()))
-        return [("day-trading bots", runner.run), ("research", research.check)]
+        # The three-fund bots run first, so they always get the data requests they need.
+        return [("day-trading bots", runner.run),
+                ("stocks in play", build_inplay(settings, store).run),
+                ("research", research.check)]
 
     from tradinglab.marketdata.tiingo import TiingoClient
 
@@ -283,27 +307,42 @@ def build_state(env: Mapping[str, str]) -> AppState:
 
 
 def start_hype(state: AppState, settings: Any, env: Mapping[str, str]) -> None:
-    """Start the hype paper bot (24/7). HYPE_BOT=off disables it. Never blocks the stock bots."""
+    """Start the hype paper bots (24/7), one per rule-set variant, each on its own pretend
+    bankroll. HYPE_BOT=off disables them. Never blocks the stock bots."""
     if env.get("HYPE_BOT", "on").strip().lower() in {"off", "0", "false", "no"}:
         return
     try:
+        from dataclasses import replace
+
         from tradinglab.engine.runtime import postgres_store
-        from tradinglab.hype.bot import FallbackSource, HypeBot, HypeRunner
+        from tradinglab.hype.bot import HypeBot, HypeRunner
         from tradinglab.hype.dexscreener import DexScreenerClient
+        from tradinglab.hype.feeds import SharedFeed
         from tradinglab.hype.geckoterminal import GeckoTerminalClient
-        from tradinglab.hype.model import Rules
+        from tradinglab.hype.model import VARIANTS
         from tradinglab.hype.store import PgHypeStore
 
-        rules = Rules(bankroll=float(env.get("HYPE_BANKROLL", "1000")),
-                      stake=float(env.get("HYPE_STAKE", "50")))
-        store = PgHypeStore(state.store)  # page reads through the dashboard's connection
-        runner = HypeRunner(
-            lambda: HypeBot(FallbackSource(GeckoTerminalClient(), DexScreenerClient()),
-                            PgHypeStore(postgres_store(settings)), rules))
-        runner.store, runner.rules = store, rules  # type: ignore[attr-defined]
+        bankroll = float(env.get("HYPE_BANKROLL", "1000"))
+        stake = float(env.get("HYPE_STAKE", "50"))
+        variants = [replace(v, rules=replace(v.rules, bankroll=bankroll, stake=stake)) for v in VARIANTS]
+        gecko, dex = GeckoTerminalClient(), DexScreenerClient()
+        # New coins: GeckoTerminal first. Open positions: DexScreener first, so a rate-limited
+        # scan feed can't stop the stops from being checked. One feed serves every variant.
+        feed = SharedFeed(discover=(gecko, dex), price=(dex, gecko))
+
+        def bots() -> list[HypeBot]:
+            pg = postgres_store(settings)  # the bot thread's own connection
+            return [HypeBot(feed, PgHypeStore(pg, v.id), v.rules, buys_enabled=v.buys_enabled, name=v.id)
+                    for v in variants]
+
+        # the pages read each account through the dashboard's connection
+        runner = HypeRunner(bots, variants=[(v, PgHypeStore(state.store, v.id)) for v in variants],
+                            feed=feed)
         state.hype = runner
         runner.start()
-        log.info("hype paper bot started ($%.0f bankroll, $%.0f per coin)", rules.bankroll, rules.stake)
+        log.info("hype paper bots started: %s ($%.0f bankroll each, $%.0f per coin)",
+                 ", ".join(v.id if v.buys_enabled else f"{v.id} (no new buys)" for v in variants),
+                 bankroll, stake)
     except Exception:  # noqa: BLE001 - the stock bots must keep running regardless
         log.exception("hype bot failed to start")
 

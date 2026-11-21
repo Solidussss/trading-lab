@@ -7,9 +7,9 @@ from datetime import date
 from pathlib import Path
 
 from tests.helpers import FAKE_TIINGO_TOKEN
-from tradinglab.marketdata.tiingo import RateLimiter
 from tradinglab.marketdata.bars import Bar, BarSeries, DatasetMeta, load_series, save_series
 from tradinglab.marketdata.calendar import trading_days
+from tradinglab.marketdata.tiingo import RateLimiter
 from tradinglab.research.backtest import BacktestConfig, EquityPoint
 from tradinglab.research.metrics import (
     attribution,

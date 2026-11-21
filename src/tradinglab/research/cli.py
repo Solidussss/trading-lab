@@ -67,7 +67,6 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     load_dotenv_if_present()
     from tradinglab.marketdata.calendar import last_completed_session
     from tradinglab.marketdata.tiingo import TiingoClient
-
     from tradinglab.safety.selfcheck import run_selfcheck
 
     settings = run_selfcheck(os.environ).settings  # guard installed, allowlist frozen

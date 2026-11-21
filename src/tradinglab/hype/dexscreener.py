@@ -131,26 +131,36 @@ class DexScreenerClient:
                     except ValueError as exc:
                         raise MarketDataError("DexScreener returned malformed JSON") from exc
                 last = f"HTTP {status}"
-                if status not in (429, 500, 502, 503, 504):
-                    break
+                if status not in (500, 502, 503, 504):  # 429 = "slow down": asking again is the
+                    break  # opposite; the shared feed (feeds.py) decides when to come back
             if attempt < self.max_attempts:
                 self._sleep(min(2 ** attempt, 10))
         raise MarketDataError(f"DexScreener unavailable: {last}")
 
     def trending_tokens(self) -> list[str]:
-        """Solana tokens being boosted or freshly profiled right now (newest first, unique)."""
+        """Solana tokens being boosted or freshly profiled right now (newest first, unique).
+
+        Raises if no list gave anything and at least one failed, so the caller can tell
+        "rate-limited" from "nothing is trending".
+        """
         seen: dict[str, None] = {}
+        failed = ""
         for path in ("/token-boosts/latest/v1", "/token-boosts/top/v1", "/token-profiles/latest/v1"):
             try:
                 rows = self._get_json(path, LIST_LIMITER)
             except MarketDataError as exc:
                 log.warning("hype: %s unavailable: %s", path, exc)
+                failed = str(exc)
+                if "429" in failed:  # rate-limited: leave the other lists alone too
+                    break
                 continue
             for r in rows if isinstance(rows, list) else []:
                 if not isinstance(r, dict) or r.get("chainId") != CHAIN:
                     continue
                 if isinstance(r.get("tokenAddress"), str):
                     seen.setdefault(r["tokenAddress"], None)
+        if failed and not seen:
+            raise MarketDataError(failed)
         return list(seen)
 
     def discover(self) -> list[Snapshot]:

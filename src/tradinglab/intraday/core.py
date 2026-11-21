@@ -41,6 +41,7 @@ from tradinglab.intraday.strategies import (
     Exit,
     IntradayStrategy,
     RunningStats,
+    Skip,
     StrategyContext,
 )
 from tradinglab.marketdata.calendar import session
@@ -348,6 +349,10 @@ class IntradayCore:
                         orders[sym] = _Order(sym, "exit", ts, sig.reason)
                         res.signals.append(ISignal(ts, sym, "exit", "ordered", sig.reason,
                                                    sig.diagnostics))
+                    continue
+                if isinstance(sig, Skip):  # seen and passed on: kept so the page can say why
+                    res.signals.append(ISignal(ts, sym, "skip", "rejected", sig.reason,
+                                               sig.diagnostics))
                     continue
                 if not isinstance(sig, Enter) or sym in positions or sym in orders:
                     continue

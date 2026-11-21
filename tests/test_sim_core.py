@@ -143,7 +143,7 @@ class StateAndControlsTests(unittest.TestCase):
         self.assertEqual(state.positions, {})
 
     def test_manual_drawdown_latch_until_resume(self):
-        d0, d2 = DAYS[0], DAYS[2]
+        d2 = DAYS[2]
         data = {"SPY": series({d2: (80, 81, 79, 80, 0.0, 1.0)})}
 
         class EnterWhenFlat(Scripted):

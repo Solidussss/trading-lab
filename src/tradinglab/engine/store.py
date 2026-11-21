@@ -72,7 +72,8 @@ class InMemoryStore(InMemoryIntradayStore):
         self._flags: dict[str, list[tuple[datetime, bool]]] = {}  # name -> history
         self._prices: dict[str, dict[date, Bar]] = {}  # display-only price history
         self._lock = threading.Lock()
-        self._locks = {"engine": self._lock, "intraday": threading.Lock()}
+        self._locks = {"engine": self._lock, "intraday": threading.Lock(),
+                       "inplay": threading.Lock()}
         self.fail_next_commit = False  # failure injection for atomicity tests
 
     def load_state(self) -> PortfolioState | None:

@@ -104,6 +104,18 @@ CREATE TABLE IF NOT EXISTS backtests (
 """
 
 
+# The morning scan's picks for the stocks-in-play bots: one JSON document per universe and day.
+PICKS_MIGRATION = """
+CREATE TABLE IF NOT EXISTS day_picks (
+    universe text NOT NULL,
+    day date NOT NULL,
+    payload jsonb NOT NULL,
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (universe, day)
+);
+"""
+
+
 def _f(x: float | None) -> float | None:
     return x if x is not None and math.isfinite(x) else None
 
@@ -233,7 +245,7 @@ class IntradayPgMixin:
                    "pnl, costs, return_pct, r_multiple, entry_reason, exit_reason")
 
     def bot_trades(self, bot_id: str, day: date | None = None) -> list[ITrade]:
-        sql = f"SELECT {self._TRADE_COLS} FROM bot_trades WHERE bot_id = %s"
+        sql = f"SELECT {self._TRADE_COLS} FROM bot_trades WHERE bot_id = %s"  # noqa: S608 - fixed column list
         params: tuple = (bot_id,)
         if day is not None:
             sql, params = sql + " AND day = %s", (bot_id, day)
@@ -255,6 +267,19 @@ class IntradayPgMixin:
         with self._tx() as cur:
             for table in ("bot_signals", "bot_fills", "bot_trades", "bot_days", "bots"):
                 cur.execute(f"DELETE FROM {table} WHERE bot_id = %s", (bot_id,))  # noqa: S608
+
+    # the morning scan's picks (stocks in play)
+    def save_picks(self, universe: str, day: date, payload: dict[str, Any]) -> None:
+        with self._tx() as cur:
+            cur.execute("INSERT INTO day_picks (universe, day, payload, updated_at) VALUES "
+                        "(%s, %s, %s::jsonb, now()) ON CONFLICT (universe, day) DO UPDATE SET "
+                        "payload = EXCLUDED.payload, updated_at = now()",
+                        (universe, day, self._json(payload)))
+
+    def picks(self, universe: str, day: date) -> dict[str, Any] | None:
+        rows = self._query("SELECT payload FROM day_picks WHERE universe = %s AND day = %s",
+                           (universe, day))
+        return _js(rows[0][0]) if rows else None
 
     # research
     def save_backtest(self, bot_id: str, payload: dict[str, Any]) -> None:

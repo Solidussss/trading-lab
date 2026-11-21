@@ -20,6 +20,7 @@ from datetime import UTC, date, datetime, timedelta
 from tradinglab.config import ConfigError, Settings
 from tradinglab.engine.live import LiveSimulationEngine, RunReport
 from tradinglab.engine.pg_store import PostgresStore
+from tradinglab.intraday.inplay import InPlayRunner
 from tradinglab.intraday.live import DEFAULT_BOTS, IntradayRunner, settled
 from tradinglab.intraday.research import backfill_status, backfill_step, run_history_test
 from tradinglab.marketdata.calendar import is_trading_day, ny_date, previous_trading_day, session
@@ -54,6 +55,14 @@ def build_engine(settings: Settings, store: PostgresStore | None = None) -> Live
 def build_intraday(settings: Settings, store: PostgresStore) -> IntradayRunner:
     client = TiingoClient(settings.require_data_token())
     return IntradayRunner(settings, store, client.iex_rows, DEFAULT_BOTS)
+
+
+def build_inplay(settings: Settings, store: PostgresStore) -> InPlayRunner:
+    client = TiingoClient(settings.require_data_token())
+    return InPlayRunner(
+        settings, store, client.iex_rows, client.iex_quotes,
+        # requests that would go through right now without the limiter making anyone wait
+        budget=lambda: SHARED_LIMITER.max_calls - SHARED_LIMITER.used())
 
 
 def market_busy(now: datetime) -> bool:

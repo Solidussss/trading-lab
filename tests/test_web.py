@@ -87,6 +87,14 @@ class WebTests(unittest.TestCase):
         self.assertIn("a safety check failed", body)
         self.assertIn("TRADING_MODE", body)
 
+    def test_every_tab_renders_before_there_is_a_database(self):
+        port, _ = self.start()
+        for path in ("/", "/stocks", "/tests", "/controls", "/hype"):
+            status, body, _ = self.get(port, path, password=PASSWORD)
+            self.assertEqual(status, 200, path)
+            self.assertIn('class="tabs"', body)
+            self.assertIn("SIM · PRETEND MONEY", body)
+
     def test_unknown_path_404(self):
         port, _ = self.start()
         self.assertEqual(self.get(port, "/admin")[0], 404)
@@ -103,12 +111,12 @@ class DashboardTests(unittest.TestCase):
     def setUpClass(cls):
         from datetime import date
 
-        from tests.test_live_engine import FlakySource, DATA, evening
+        from tests.helpers import settings
+        from tests.test_live_engine import DATA, FlakySource, evening
         from tradinglab.engine.live import LiveSimulationEngine
         from tradinglab.engine.store import InMemoryStore
         from tradinglab.marketdata.calendar import trading_days
         from tradinglab.strategies.trend_following import TrendFollowing
-        from tests.helpers import settings
 
         cls.store = InMemoryStore()
         cls.engine = LiveSimulationEngine(settings(), cls.store, FlakySource(DATA),
@@ -244,11 +252,26 @@ class BotDashboardTests(unittest.TestCase):
         status, body, _ = WebTests.get(self, port, password=PASSWORD)
         self.assertEqual(status, 200)
         for name in ("Opening breakout", "Gap-down bounce", "Dip below the day", "Ride the day",
-                     "The bots", "How they did on past prices", "Pause new buys"):
+                     "Leaderboard", "Latest trades", "System health", "SIM · PRETEND MONEY"):
             self.assertIn(name, body)
         for b in ("orb", "gap", "vwap_dip", "vwap_trend"):
             self.assertIn(f"href='/bot/{b}'", body)
+
+    def test_every_tab_renders_in_the_shared_look(self):
+        port, _ = self.start()
+        for path, text in (("/stocks", "The bots"), ("/tests", "How they did on past prices"),
+                           ("/controls", "Pause new buys"), ("/hype", "hype bot")):
+            status, body, _ = WebTests.get(self, port, path, password=PASSWORD)
+            self.assertEqual(status, 200, path)
+            self.assertIn(text, body)
+            self.assertIn("class=\"tabs\"", body)
+            self.assertNotIn(FAKE_TIINGO_TOKEN, body)
+            self.assertNotIn(PASSWORD, body)
+            self.assertEqual(WebTests.get(self, port, path)[0], 401)
+        _, body, _ = WebTests.get(self, port, "/stocks", password=PASSWORD)
         self.assertIn("1,000,000", body)
+        for b in ("orb", "gap", "vwap_dip", "vwap_trend"):
+            self.assertIn(f"href='/bot/{b}'", body)
 
     def test_bot_page_explains_each_trade(self):
         port, _ = self.start()

@@ -86,6 +86,31 @@ class Rules:
     lp_fee: float = 0.0025
     latency_penalty: float = 0.02
     network_fee_usd: float = 0.10
+    # guard rails
+    no_repeat_losers: bool = False  # never buy a coin again after closing it at a loss
+    auto_pause_drawdown: float = 0.30  # stop buying once the account is this far below its start
+
+
+@dataclass(frozen=True)
+class Variant:
+    """One rule set, run side by side with the others on its own pretend bankroll."""
+
+    id: str
+    name: str
+    blurb: str
+    rules: Rules
+    buys_enabled: bool = True  # False = paused for new buys; open positions still exit by the rules
+
+
+VARIANTS: tuple[Variant, ...] = (
+    Variant("current", "Current rules", "Chases 5-minute jumps", Rules(), buys_enabled=False),
+    Variant("no_repeat", "No repeat losers", "Never re-buys a coin it lost on",
+            Rules(no_repeat_losers=True, cooldown_hours=24.0)),
+    Variant("deep_pools", "Bigger pools only", "Skips anything under $100k in the pool",
+            Rules(min_liquidity=100_000.0, min_mcap=500_000.0, min_txns_5m=80)),
+)
+
+BANNED_MAX = 500  # how many lost-on coins an account remembers
 
 
 def score(s: Snapshot) -> float:
@@ -206,12 +231,15 @@ class Account:
     last_error: str = ""
     cycles: int = 0
     curve: list[list] = field(default_factory=list)  # [[iso time, portfolio value], ...]
+    banned: list[str] = field(default_factory=list)  # tokens it closed at a loss; newest last
+    paused: str = ""  # non-empty = the reason it stopped buying (exits carry on)
 
     def to_json(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_json(cls, d: dict) -> Account:
+        """Rows saved before `banned` and `paused` existed load with those fields empty."""
         d = dict(d)
         d["positions"] = [Position(**p) for p in d.get("positions", [])]
         return cls(**d)

@@ -129,6 +129,20 @@ class IntradayOnPostgresTests(PgTestCase):
         self.assertEqual(self.store.bot_days("orb"), [])
         self.assertTrue(self.store.bot_days("gap"))
 
+    def test_morning_picks_round_trip_and_overwrite(self):
+        day = date(2024, 3, 4)
+        self.assertIsNone(self.store.picks("in_play", day))
+        payload = {"at": "2024-03-04T14:40:00+00:00", "scanned": 100, "note": "",
+                   "picks": [{"symbol": "AAA", "gap": 0.03, "last": 104.0, "open": 103.0,
+                              "prev_close": 100.0}]}
+        self.store.save_picks("in_play", day, payload)
+        self.assertEqual(self.store.picks("in_play", day), payload)
+        self.store.save_picks("in_play", day, {**payload, "picks": [], "note": "redone"})
+        self.assertEqual(self.store.picks("in_play", day)["note"], "redone")
+        self.assertIsNone(self.store.picks("in_play", date(2024, 3, 5)))
+        with self.store.run_lock("inplay"), self.store.run_lock("intraday"):
+            pass  # the stocks-in-play lock is its own lock
+
     def test_intraday_and_daily_locks_are_independent(self):
         with self.store.run_lock("engine"):
             with self.store.run_lock("intraday"):

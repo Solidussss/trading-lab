@@ -2,8 +2,8 @@
 atomic commits, controls, and exact parity with the research backtester."""
 
 import unittest
-from decimal import Decimal
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 
 from tests.helpers import settings
 from tradinglab.engine.live import SETTLE_MINUTES, LiveSimulationEngine

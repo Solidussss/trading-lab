@@ -106,8 +106,8 @@ class GeckoTerminalClient:
                     except ValueError as exc:
                         raise MarketDataError("GeckoTerminal returned malformed JSON") from exc
                 last = f"HTTP {status}"
-                if status not in (429, 500, 502, 503, 504):
-                    break
+                if status not in (500, 502, 503, 504):  # 429 = "slow down": asking again is the
+                    break  # opposite; the shared feed (feeds.py) decides when to come back
             if attempt < self.max_attempts:
                 self._sleep(min(3 * attempt, 10))
         raise MarketDataError(f"GeckoTerminal unavailable: {last}")
@@ -120,8 +120,13 @@ class GeckoTerminalClient:
         return [s for p in payload.get("data") or [] if (s := parse_pool(p, toks, now)) is not None]
 
     def discover(self) -> list[Snapshot]:
-        """Trending (2 pages) + newest pools on Solana, one snapshot per token (most liquid pool)."""
+        """Trending (2 pages) + newest pools on Solana, one snapshot per token (most liquid pool).
+
+        Raises if no list gave anything and at least one failed, so the caller can tell
+        "rate-limited" from "nothing is trending".
+        """
         best: dict[str, Snapshot] = {}
+        failed = ""
         for path in (f"/networks/{NETWORK}/trending_pools?include=base_token&page=1",
                      f"/networks/{NETWORK}/trending_pools?include=base_token&page=2",
                      f"/networks/{NETWORK}/new_pools?include=base_token&page=1"):
@@ -129,10 +134,15 @@ class GeckoTerminalClient:
                 pools = self._pools(path)
             except MarketDataError as exc:
                 log.warning("hype: %s unavailable: %s", path, exc)
+                failed = str(exc)
+                if "429" in failed:  # rate-limited: leave the other lists alone too
+                    break
                 continue
             for s in pools:
                 if s.token not in best or s.liquidity > best[s.token].liquidity:
                     best[s.token] = s
+        if failed and not best:
+            raise MarketDataError(failed)
         return list(best.values())
 
     def snapshots(self, tokens: Iterable[str], pairs: dict[str, str] | None = None) -> dict[str, Snapshot]:

@@ -1,10 +1,11 @@
 # Trading Lab
 
-Private, autonomous, **simulation-only** trading research system for SPY, QQQ and IWM. It
-runs several pretend-money bots side by side, each with its own $1,000,000 simulated account:
-seven day-trading bots on 5-minute prices (flat every night) and one slow daily trend follower.
-Prices come from Tiingo. There is no brokerage connection and no real-money trading code; see
-`docs/SAFETY.md`.
+Private, autonomous, **simulation-only** trading research system. It runs pretend-money bots
+side by side, each with its own simulated account: seven day-trading bots on SPY, QQQ and IWM
+(5-minute prices, flat every night), one slow daily trend follower, two "stocks in play" bots
+that trade the day's busiest stocks, and three competing rule sets of a Solana memecoin hype
+bot. Stock prices come from Tiingo. There is no brokerage connection and no real-money trading
+code; see `docs/SAFETY.md`.
 
 ## Status
 
@@ -18,6 +19,9 @@ Prices come from Tiingo. There is no brokerage connection and no real-money trad
 | 6 | Authenticated mobile dashboard | ✅ leaderboard, one page per bot (every trade explained), history-test results, controls |
 | 7 | More strategies | ✅ seven day-trading bots (opening breakout, gap-down bounce, VWAP dip, VWAP trend, fair value gap, plus two from published research: noise-area breakout (Zarattini, Aziz & Barbon 2024) and last-half-hour momentum (Gao, Han, Li & Zhou 2018)) on a shared intraday core with market and resting limit orders; independently reviewed |
 | 7b | Intraday history tests | ✅ background loader (Aug 2017 on) + fixed train/validation windows, sealed final test |
+| 9 | One dashboard look (`web/theme.py`): Overview, Stocks, Crypto, History tests, Controls | ✅ |
+| 10 | Stocks in play: morning scan of ~100 stocks, opening breakouts in the top five gappers, and an odds-checked twin that replays the rest of the day before each entry | ✅ forward paper trading only (no history test) |
+| 11 | Hype bot rule sets side by side, positions priced from DexScreener first, back-off when rate-limited | ✅ |
 | 8 | Claude research reports (scheduled / on demand only) | |
 
 ## Architecture
@@ -72,6 +76,11 @@ new bot starts on the next session with $1,000,000. In the background, the remai
 request budget loads intraday history back to August 2017 and re-runs the history tests. `python main.py nightly` runs one check and exits,
 if you prefer a separate Railway cron service.
 
+A few minutes after each open the stocks-in-play scan makes one Tiingo quote request for the
+whole list in `intraday/universe.py` and stores that day's picks; the picks' 5-minute prices are
+then loaded inside an allowance of 6 requests an hour, after the three funds (so their
+daytime view updates about once an hour; results come from complete prices after the close).
+
 Do not add brokerage or proxy variables: the app refuses to start its trading functions
 if it sees them.
 
@@ -102,8 +111,11 @@ src/tradinglab/
   sim/core.py         the simulation core (one session at a time, serialisable state)
   engine/live.py      live paper simulation driver; engine/store.py persistence interface
   research/           backtester, costs, metrics, splits/walk-forward/test vault, CLI
-  intraday/           day-trading core, strategies, live runner, history tests
-  web/                dashboard (views_bots.py: leaderboard and bot pages)
+  intraday/           day-trading core, strategies, live runner, history tests;
+                      inplay.py (morning scan + runner), replay.py (odds replay), universe.py
+  hype/               memecoin hype paper bot: rule sets, feeds, cost model
+  web/                dashboard (theme.py: the shared look; views_bots.py: overview and bot
+                      pages; views_hype.py: the crypto page)
   broker/base.py      future brokerage interface (documentation only)
 tests/                unittest-style; run with pytest or `python -m unittest`
 docs/                 SAFETY.md, DATA.md, RESEARCH.md

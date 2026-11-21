@@ -46,7 +46,7 @@ class InMemoryIntradayStore:
     def _istore(self) -> dict[str, Any]:
         if not hasattr(self, "_intraday"):
             self._intraday = {"bars": {}, "fetches": {}, "bots": {}, "days": {}, "trades": {},
-                              "fills": {}, "signals": {}, "backtests": {}}
+                              "fills": {}, "signals": {}, "backtests": {}, "picks": {}}
         return self._intraday
 
     # prices
@@ -121,6 +121,14 @@ class InMemoryIntradayStore:
         s = self._istore()
         for k in ("bots", "days", "trades", "fills", "signals"):
             s[k].pop(bot_id, None)
+
+    # the morning scan's picks (stocks in play)
+    def save_picks(self, universe: str, day: date, payload: dict[str, Any]) -> None:
+        self._istore()["picks"][(universe, day)] = copy.deepcopy(payload)
+
+    def picks(self, universe: str, day: date) -> dict[str, Any] | None:
+        p = self._istore()["picks"].get((universe, day))
+        return copy.deepcopy(p) if p is not None else None
 
     # research
     def save_backtest(self, bot_id: str, payload: dict[str, Any]) -> None:

@@ -12,11 +12,13 @@ not tuned to the data (tuning happens only on the training window, and is record
 from __future__ import annotations
 
 import math
+import zlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Any, ClassVar
 
+from tradinglab.intraday.replay import Odds, replay
 from tradinglab.marketdata.calendar import NY, session
 from tradinglab.marketdata.intraday import IBar
 
@@ -41,7 +43,14 @@ class Exit:
     diagnostics: Mapping[str, float] = field(default_factory=dict)
 
 
-Signal = Enter | Exit
+@dataclass(frozen=True)
+class Skip:
+    """A setup the strategy saw and chose not to take. Recorded so the page can say why."""
+    reason: str
+    diagnostics: Mapping[str, float] = field(default_factory=dict)
+
+
+Signal = Enter | Exit | Skip
 
 
 class RunningStats:
@@ -426,11 +435,75 @@ class LateDayMomentum(IntradayStrategy):
                      diagnostics={"first_half_hour": first, "close": ctx.bar.close})
 
 
+_ODDS_CACHE: dict[tuple, Odds | None] = {}
+
+
+class OrbOdds(OpeningRangeBreakout):
+    """The opening breakout, but each entry must first pass the odds replay (intraday/replay.py):
+    the rest of the session is replayed from the stock's own bars on up to 15 earlier days, and
+    the trade is taken only when the average replay result is clearly positive."""
+
+    id = "orb_odds"
+    name = "Opening breakout, odds-checked"
+    summary = ("Buys an opening breakout only when a replay of the stock's recent days says the "
+               "odds are on its side.")
+    rules = ("Notes the highest and lowest price of the first 15 minutes.",
+             "When a 5-minute bar closes above that high, replays the rest of the day 2,000 times "
+             "using what the stock did at the same times on up to 15 earlier days.",
+             "Buys only if the replays' average result is at least a tenth of the amount risked. "
+             "Otherwise it passes, and says so.",
+             "Passes on any stock with fewer than 10 earlier days of prices.",
+             "Safety stop at the first 15 minutes' low. Sells at the close, or earlier if the "
+             "stop is hit.")
+    history_days = 15
+    defaults = {"range_minutes": 15, "min_exp_r": 0.1, "min_sessions": 10, "paths": 2000}
+
+    def odds(self, ctx: StrategyContext, stop: float) -> Odds | None:
+        k = round((ctx.bar.ts - ctx.open_utc).total_seconds() / 60)
+        # The history itself is part of the key (bar count and a sum of closes), so odds worked
+        # out on a partly loaded history are never reused once the rest arrives.
+        shape = (sum(len(bars) for bars in ctx.history),
+                 round(sum(b.close for bars in ctx.history for b in bars), 4))
+        key = (ctx.symbol, ctx.day, k, ctx.close_utc, round(ctx.bar.close, 4), round(stop, 4), shape,
+               int(self.params["paths"]), int(self.params["min_sessions"]))
+        if key in _ODDS_CACHE:
+            return _ODDS_CACHE[key]
+        seed = zlib.crc32(f"{ctx.symbol}|{ctx.day.isoformat()}|{k}".encode())
+        minutes = round((ctx.close_utc - ctx.open_utc).total_seconds() / 60)
+        odds = replay(ctx.history, k, ctx.bar.close, stop, seed=seed, session_minutes=minutes,
+                      paths=int(self.params["paths"]),
+                      min_sessions=int(self.params["min_sessions"]))
+        if len(_ODDS_CACHE) > 512:  # web threads and the scheduler share this: never re-read it
+            _ODDS_CACHE.clear()
+        _ODDS_CACHE[key] = odds
+        return odds
+
+    def on_bar(self, ctx: StrategyContext) -> Signal | None:
+        sig = super().on_bar(ctx)
+        if not isinstance(sig, Enter):
+            return sig
+        odds = self.odds(ctx, sig.stop)
+        if odds is None:
+            return Skip("not_enough_history", {"sessions": float(len(ctx.history))})
+        diag = {**sig.diagnostics, "replay_exp_r": odds.exp_r, "replay_p_stop": odds.p_stop,
+                "replay_p_up": odds.p_up, "replay_sessions": float(odds.sessions),
+                "replay_paths": float(odds.paths), "replay_needed": float(self.params["min_exp_r"])}
+        if odds.exp_r < self.params["min_exp_r"]:
+            return Skip("replay_odds_too_low", diag)
+        return Enter(sig.stop, sig.reason, diagnostics=diag)
+
+
 REGISTRY: dict[str, type[IntradayStrategy]] = {
     cls.id: cls for cls in (OpeningRangeBreakout, GapFill, VwapDip, VwapTrend, FairValueGap,
                              NoiseBreakout, LateDayMomentum)
 }
 
 
+# Strategies that only run on the day's stocks in play (never on the three funds, and without a
+# history test), plus everything, for looking a bot's strategy up by id.
+IN_PLAY_ONLY: dict[str, type[IntradayStrategy]] = {OrbOdds.id: OrbOdds}
+ALL_STRATEGIES: dict[str, type[IntradayStrategy]] = {**REGISTRY, **IN_PLAY_ONLY}
+
+
 def create(strategy_id: str, **params: Any) -> IntradayStrategy:
-    return REGISTRY[strategy_id](**params)
+    return ALL_STRATEGIES[strategy_id](**params)

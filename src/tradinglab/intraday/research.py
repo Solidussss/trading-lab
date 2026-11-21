@@ -29,8 +29,8 @@ from tradinglab.intraday.live import BotSpec
 from tradinglab.marketdata.calendar import previous_trading_day, trading_days
 from tradinglab.marketdata.intraday import (
     INTRADAY_HISTORY_START,
-    detect_end_labelled,
     chunks,
+    detect_end_labelled,
     parse_iex_rows,
     split_by_day,
 )
